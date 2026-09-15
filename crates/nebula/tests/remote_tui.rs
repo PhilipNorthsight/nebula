@@ -349,6 +349,7 @@ async fn mixed_projects_switch_and_survive_bridge_loss_without_local_tool_access
     screen.wait("typing");
     screen.send(b"printf 'OWNING_HOST=%s\\n' \"$PEER_MARKER\"\r");
     screen.wait("OWNING_HOST=LOCAL");
+    screen.capture("mixed-local");
     screen.send(b"\x11j\r\r");
     screen.wait("typing");
     screen.send(b"KEEP=survived; printf 'OWNING_HOST=%s\\n' \"$PEER_MARKER\"\r");
@@ -405,6 +406,7 @@ async fn mixed_projects_switch_and_survive_bridge_loss_without_local_tool_access
     screen.send(b"\r\r");
     screen.send(b"printf 'REMOTE_KEEP=%s\\n' \"$KEEP\"\r");
     screen.wait("REMOTE_KEEP=survived");
+    screen.capture("mixed-reconnected");
     assert!(!replay.exists(), "reconnect replayed discarded input");
     // The remote agent and remote plain terminal both attach through the same view.
     screen.send(b"\x11\tj\r");

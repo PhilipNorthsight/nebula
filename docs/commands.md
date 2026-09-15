@@ -21,6 +21,7 @@ nebula open <file>…         show files in this nebula's file tabs       (agent
 nebula workspace <cmd>      manage workspaces — named groups of projects
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
+nebula remote               view local and saved SSH projects together (prototype)
 nebula ssh <host>           open nebula on a remote host over ssh
 nebula tunnel <host>        open a remote host's nebula in a tab here
 nebula upgrade              install the latest published nebula
@@ -95,11 +96,8 @@ See [Configuration](configuration.md#backup-restore-and-other-machines).
 
 ## Mixed local / SSH project view (prototype)
 
-`nebula remote` shows existing local sessions and saved SSH projects together without
-replacing the project list. `nebula remote add <alias> /absolute/repo` saves a reference,
-`remote list` prints JSON, and `remote remove <alias> /absolute/repo` forgets one locally.
-Both daemons must already be running; no install/settings sync or remote file/git/GitHub
-UI is provided. [Preparation, keys, disconnect and cleanup](remote-projects.md).
+See [Mixed local / SSH projects](remote-projects.md) for `nebula remote`, its `add`,
+`list` and `remove` subcommands, prerequisites, keys and disconnect handling.
 
 ## Other machines, other screens
 

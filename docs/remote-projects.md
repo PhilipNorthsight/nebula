@@ -27,7 +27,7 @@ Start with a disposable SSH host/user, not a client production environment. Buil
 revision for that remote's platform and explicitly put its binary on the remote PATH
 (`~/.local/bin` is also searched). Do not overwrite an existing installation or restart
 a working daemon merely to try the prototype. Installation is an operator prerequisite:
-**Nebula never installs, upgrades, starts a remote daemon, or synchronizes settings.**
+**`nebula remote` never installs, upgrades, starts a remote daemon, or synchronizes settings.**
 
 Using invented alias `dev-box` and checkout `/srv/app`, prepare **on the remote**:
 
@@ -89,6 +89,10 @@ Create new sessions in normal Nebula on their owning machine first. There are in
 no file/editor/diff/GitHub actions, settings sync, cloud UI, clipboard forwarding or mouse
 controls in this prototype—even on local rows. Use the owning terminal's tools or the
 normal TUI instead. Remote `nebula open` events do not read matching laptop paths.
+
+If attachment fails, the footer shows the error and terminal input is blocked. Resolve
+the cause on the owning machine (for example, restore a missing agent executable), then
+press **Ctrl+q** and **Enter** twice to retry the selected session and resume typing.
 
 ## Disconnect and reconnect
 

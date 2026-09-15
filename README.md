@@ -76,9 +76,10 @@ says so and offers to do it for you. `nebula --version`
 > **Prerequisite:** at least one agent CLI on your `PATH` — `claude`, `codex`, `cursor-agent`, or `pi`.
 > nebula spawns them; it doesn't ship them.
 >
-> Three commands each want one more binary, and only those commands: `nebula ssh` and `nebula tunnel`
+> `nebula ssh` and `nebula tunnel`
 > exit if there is no OpenSSH client (`ssh`), and `nebula browser` needs `ttyd` on your `PATH` — for
-> `nebula tunnel` it is the *remote* host that needs it. The TUI itself needs neither.
+> `nebula tunnel` it is the *remote* host that needs it. The normal local TUI needs neither.
+> For the mixed-project prototype's prerequisites, see [its setup guide](docs/remote-projects.md#build-and-prepare).
 
 ## Quickstart
 
@@ -121,11 +122,9 @@ Claude's prompt box and `/resume` picker on your next prompt.
 
 ## Local and SSH projects together (prototype)
 
-`nebula remote` opens an opt-in combined project/session/terminal view. Add a remote
-reference with `nebula remote add <ssh-alias> /absolute/repo/path`; agents, files and
-credentials stay on their owning machine. Both daemons must already be running and the
-remote needs this branch's binary. Nothing is installed or synchronized automatically.
-Plain `nebula` keeps the full local UI. [Build, test and limitations](docs/remote-projects.md).
+`nebula remote` opens an opt-in combined project/session/terminal view; agents, files and
+credentials stay on their owning machine. Plain `nebula` keeps the full local UI.
+See [setup, usage, testing and limitations](docs/remote-projects.md).
 
 ## Read the dots, not the screens
 
@@ -177,7 +176,7 @@ is open.
 | | |
 |---|---|
 | [**Keys**](docs/keys.md) | Every default binding, the WORKTREE views (`g` `f` `F` `b`), and the mouse. All of it rebindable. |
-| [**Commands**](docs/commands.md) | The `nebula` CLI: `add`, `rename`, `worktree`, `spawn`, `workspace`, `config`, `ssh`, `tunnel`, `browser`, `daemon`, `kill`, `upgrade`. |
+| [**Commands**](docs/commands.md) | CLI usage, flags and examples. |
 | [**Sessions**](docs/sessions.md) | The NEW SESSION PICKER, MODEL / EFFORT, Claude Cloud and the CLOUD SESSION PANEL, AGENT PRESETS, the PROJECT OPEN PRS group, the ISSUES MODAL. |
 | [**Configuration**](docs/configuration.md) | `config.json` and `config.local.json`, backup and restore, the SETTINGS OVERLAY, the HOTKEYS TAB, the `.nebula.json` PROJECT FILE (`r` runs a worktree, `Shift+Enter` opens it), compatibility rules, logs and environment overrides. |
 | [**How it works**](docs/how-it-works.md) | The DAEMON, the hook dialects, AUTO-TITLE, WORKTREE RELOCATION, prewarm and reaping, persistence. |
