@@ -30,6 +30,7 @@ pub mod pull_request;
 pub mod quick_prompt;
 pub mod raw_attach;
 pub mod remote;
+pub mod remote_projects;
 pub mod review;
 pub mod splash;
 pub mod syntax;

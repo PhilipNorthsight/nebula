@@ -6,7 +6,7 @@ mod upgrade;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, WorkspaceCommand};
+use cli::{Cli, Command, ConfigCommand, RemoteCommand, WorkspaceCommand};
 use std::path::Path;
 
 fn main() -> Result<()> {
@@ -14,7 +14,9 @@ fn main() -> Result<()> {
     // A `nebula ssh` / `nebula tunnel` from another machine may have sent its
     // settings along. Merge them before anything reads a setting, and before
     // a thread or a child exists to inherit the variable.
-    nebula_tui::bundle::apply_forwarded();
+    if !matches!(&cli.command, Some(Command::Stdio | Command::Remote { .. })) {
+        nebula_tui::bundle::apply_forwarded();
+    }
     match cli.command {
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
@@ -72,6 +74,17 @@ fn main() -> Result<()> {
             credential,
             open: !no_open,
         }),
+        Some(Command::Stdio) => nebula_tui::remote_projects::transport::bridge(),
+        Some(Command::Remote { command }) => match command {
+            None => nebula_tui::remote_projects::run(),
+            Some(RemoteCommand::Add { host, path }) => {
+                nebula_tui::remote_projects::save_project(host, path, false)
+            }
+            Some(RemoteCommand::Remove { host, path }) => {
+                nebula_tui::remote_projects::save_project(host, path, true)
+            }
+            Some(RemoteCommand::List) => nebula_tui::remote_projects::list(),
+        },
         Some(Command::Ssh {
             host,
             path,

@@ -10,8 +10,8 @@
 
 use std::process::Command;
 
-/// Every command `nebula --help` lists, plus the `workspace` subcommands.
-/// Hidden ones (`_raw-attach`, `_stale-daemon-note`) are deliberately absent.
+/// Every command `nebula --help` lists, plus their subcommands.
+/// Internal commands are deliberately absent.
 const VISIBLE: &[&[&str]] = &[
     &["add"],
     &["daemon"],
@@ -31,6 +31,10 @@ const VISIBLE: &[&[&str]] = &[
     &["config", "export"],
     &["config", "import"],
     &["browser"],
+    &["remote"],
+    &["remote", "add"],
+    &["remote", "list"],
+    &["remote", "remove"],
     &["ssh"],
     &["tunnel"],
     &["upgrade"],
@@ -124,8 +128,8 @@ fn the_root_help_lists_one_line_per_command() {
     }
     assert_eq!(
         commands.lines().count(),
-        14,
-        "thirteen commands plus `help`:\n{commands}"
+        15,
+        "fourteen commands plus `help`:\n{commands}"
     );
 }
 
@@ -171,7 +175,7 @@ fn hidden_commands_stay_hidden() {
         pages.push(help_at("100", &with_help));
     }
     for page in pages {
-        for hidden in ["_raw-attach", "_stale-daemon-note"] {
+        for hidden in ["_raw-attach", "_stale-daemon-note", "_stdio"] {
             assert!(!page.contains(hidden), "{hidden} is listed in:\n{page}");
         }
     }

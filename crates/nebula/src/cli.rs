@@ -52,6 +52,19 @@ pub(crate) struct Cli {
     pub(crate) workspace: Option<String>,
 }
 
+#[derive(Subcommand)]
+pub(crate) enum RemoteCommand {
+    /// Save a remote checkout reference here, without connecting.
+    #[command(after_help = "Example:\n  nebula remote add dev-box /srv/app")]
+    Add { host: String, path: String },
+    /// Print saved remote project references as JSON.
+    #[command(after_help = "Example:\n  nebula remote list")]
+    List,
+    /// Forget a local reference; never remove remote files or sessions.
+    #[command(after_help = "Example:\n  nebula remote remove dev-box /srv/app")]
+    Remove { host: String, path: String },
+}
+
 const ROOT_EXAMPLES: &str = "\
 Examples:
   nebula                            open the TUI (auto-starts the daemon)
@@ -242,6 +255,22 @@ pub(crate) enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// View local and saved SSH projects together (prototype).
+    ///
+    /// With no subcommand, opens a limited PROJECTS / SESSIONS / TERMINAL
+    /// view. Both daemons must already be running. Only existing sessions
+    /// can be attached; file, git and GitHub actions stay in their terminal.
+    /// Plain nebula still opens the full local TUI.
+    #[command(
+        after_help = "Examples:\n  nebula remote add dev-box /srv/app\n  nebula remote list\n  nebula remote\n  nebula remote remove dev-box /srv/app"
+    )]
+    Remote {
+        #[command(subcommand)]
+        command: Option<RemoteCommand>,
+    },
+    /// Internal connect-only socket bridge. Never installs or starts a daemon.
+    #[command(name = "_stdio", hide = true)]
+    Stdio,
     /// Open nebula on a remote host over ssh.
     ///
     /// Connects with ssh and runs nebula there, installing it on the remote

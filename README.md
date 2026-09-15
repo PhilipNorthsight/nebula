@@ -119,6 +119,14 @@ Redirect`, not `agent-3`; `r` renames it whenever you like. A Claude SESSION's o
 is the same name: `/rename` inside Claude Code retitles the row, and a name set in nebula reaches
 Claude's prompt box and `/resume` picker on your next prompt.
 
+## Local and SSH projects together (prototype)
+
+`nebula remote` opens an opt-in combined project/session/terminal view. Add a remote
+reference with `nebula remote add <ssh-alias> /absolute/repo/path`; agents, files and
+credentials stay on their owning machine. Both daemons must already be running and the
+remote needs this branch's binary. Nothing is installed or synchronized automatically.
+Plain `nebula` keeps the full local UI. [Build, test and limitations](docs/remote-projects.md).
+
 ## Read the dots, not the screens
 
 | Dot | AGENT STATUS |

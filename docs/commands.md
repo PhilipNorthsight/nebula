@@ -93,6 +93,14 @@ nebula config import <source>   # merge a backup in: an export, a bare config.js
 
 See [Configuration](configuration.md#backup-restore-and-other-machines).
 
+## Mixed local / SSH project view (prototype)
+
+`nebula remote` shows existing local sessions and saved SSH projects together without
+replacing the project list. `nebula remote add <alias> /absolute/repo` saves a reference,
+`remote list` prints JSON, and `remote remove <alias> /absolute/repo` forgets one locally.
+Both daemons must already be running; no install/settings sync or remote file/git/GitHub
+UI is provided. [Preparation, keys, disconnect and cleanup](remote-projects.md).
+
 ## Other machines, other screens
 
 ```sh
