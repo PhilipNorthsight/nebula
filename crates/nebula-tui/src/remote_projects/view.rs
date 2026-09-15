@@ -18,6 +18,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,6 +39,7 @@ struct Peer {
     online: bool,
     note: String,
     connection: Option<Connection>,
+    pending_attaches: VecDeque<SessionRef>,
 }
 
 struct View {
@@ -62,6 +64,7 @@ impl View {
                 online: false,
                 note: "connecting".into(),
                 connection: None,
+                pending_attaches: VecDeque::new(),
             })
             .collect();
         Self {
@@ -84,6 +87,7 @@ impl View {
         }
         let p = &mut self.peers[peer];
         p.connection = None; // Cancels the old socket, including its unsent input queue.
+        p.pending_attaches.clear();
         p.generation += 1;
         p.online = false;
         p.note = "connecting".into();
@@ -183,6 +187,7 @@ impl View {
     fn offline(&mut self, peer: usize, note: String) {
         let p = &mut self.peers[peer];
         p.online = false;
+        p.pending_attaches.clear();
         p.generation += 1;
         p.note = note;
         p.connection = None;
@@ -245,6 +250,7 @@ impl View {
         self.detach();
         self.term = Some(AttachedTerm::new(session.clone(), self.size.0, self.size.1));
         self.active_peer = Some(peer);
+        self.peers[peer].pending_attaches.push_back(session.clone());
         self.send(
             peer,
             ClientRequest::Attach {
@@ -351,7 +357,13 @@ impl View {
                 return;
             }
         };
+        let selected_session = self.sessions().get(self.session).map(|(id, _)| id.clone());
         let p = &mut self.peers[peer];
+        if let ServerEvent::Scrollback { session, .. } = &event {
+            if p.pending_attaches.front() == Some(session) {
+                p.pending_attaches.pop_front();
+            }
+        }
         match event {
             ServerEvent::Snapshot {
                 projects,
@@ -381,7 +393,20 @@ impl View {
                 EntityId::Terminal(id) => p.tree.terminals.retain(|t| t.id != id),
                 _ => {}
             },
-            ServerEvent::Error { message, .. } => self.flash = message,
+            ServerEvent::Error { req_id, message } => {
+                if req_id.is_none() && message.starts_with("attach: ") {
+                    if let Some(session) = p.pending_attaches.pop_front() {
+                        if self.active_peer == Some(peer) && p.pending_attaches.is_empty() {
+                            if let Some(term) = &mut self.term {
+                                if term.sref == session {
+                                    term.exited = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.flash = message;
+            }
             // Crucially, FilesOpened is NOT handled: a remote path can never
             // fall through to the local editor, git, gh or a filesystem read.
             ServerEvent::FilesOpened { .. } => {
@@ -428,7 +453,9 @@ impl View {
         {
             self.detach();
         }
-        self.session = self.session.min(sessions.len().saturating_sub(1));
+        self.session = selected_session
+            .and_then(|selected| sessions.iter().position(|(id, _)| *id == selected))
+            .unwrap_or_else(|| self.session.min(sessions.len().saturating_sub(1)));
     }
 
     fn draw(&mut self, f: &mut Frame) {

@@ -252,3 +252,160 @@ async fn a_real_render_keeps_both_projects_visible_during_remote_attach_and_loss
     assert!(screen.contains("local-repo [local]"));
     assert!(screen.contains("OFFLINE"));
 }
+
+fn terminal_row(id: &str) -> TerminalTab {
+    TerminalTab {
+        id: TerminalId(id.into()),
+        worktree_id: WorktreeId("same-worktree".into()),
+        name: id.into(),
+        sort_order: 0,
+        alive: true,
+        run_command: None,
+    }
+}
+
+#[tokio::test]
+async fn selection_follows_identity_when_preceding_rows_are_removed_and_inserted() {
+    for attached in [false, true] {
+        let (mut view, mut local, mut remote) = fixture();
+        let mut initial = snapshot("local-repo", "/local-repo");
+        if let ServerEvent::Snapshot { terminals, .. } = &mut initial {
+            *terminals = vec![terminal_row("a"), terminal_row("b"), terminal_row("c")];
+        }
+        event(&mut view, 0, initial.clone());
+        view.session = 1;
+        let selected = SessionRef::Terminal(TerminalId("b".into()));
+        if attached {
+            view.attach();
+            assert!(
+                matches!(local.try_recv(), Ok(ClientRequest::Attach { session, .. }) if session == selected)
+            );
+            view.focus = Focus::Terminal;
+        }
+        event(
+            &mut view,
+            0,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Terminal(TerminalId("a".into())),
+            },
+        );
+        assert_eq!(view.session, 0);
+        assert_eq!(view.sessions()[view.session].0, selected);
+        event(&mut view, 0, initial);
+        assert_eq!(view.session, 1);
+        assert_eq!(view.sessions()[view.session].0, selected);
+        assert!(local.try_recv().is_err());
+        if attached {
+            assert_eq!(view.term.as_ref().unwrap().sref, selected);
+            view.key(key('x'));
+            assert!(
+                matches!(local.try_recv(), Ok(ClientRequest::Input { session, data }) if session == selected && data == b"x")
+            );
+        }
+        assert!(remote.try_recv().is_err());
+    }
+}
+
+fn attach_error() -> ServerEvent {
+    ServerEvent::Error {
+        req_id: None,
+        message: "attach: executable unavailable".into(),
+    }
+}
+
+#[tokio::test]
+async fn failed_attach_blocks_typing_and_allows_explicit_retry() {
+    let (mut view, mut local, mut remote) = fixture();
+    view.key(key('j'));
+    let session = SessionRef::Terminal(TerminalId("same-terminal".into()));
+    assert!(matches!(
+        remote.try_recv(),
+        Ok(ClientRequest::Attach { .. })
+    ));
+    view.focus = Focus::Terminal;
+    event(&mut view, 1, attach_error());
+    assert!(view.term.as_ref().unwrap().exited);
+    assert_eq!(view.focus, Focus::Terminal);
+    view.key(key('x'));
+    view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(remote.try_recv().is_err());
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    terminal.draw(|f| view.draw(f)).unwrap();
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("input blocked"));
+    while remote.try_recv().is_ok() {}
+    view.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        remote.try_recv(),
+        Ok(ClientRequest::Detach { .. })
+    ));
+    assert!(
+        matches!(remote.try_recv(), Ok(ClientRequest::Attach { session: retry, .. }) if retry == session)
+    );
+    event(
+        &mut view,
+        1,
+        ServerEvent::Scrollback {
+            session: session.clone(),
+            base_seq: 0,
+            data: b"ready".to_vec(),
+        },
+    );
+    view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    view.key(key('x'));
+    assert!(
+        matches!(remote.try_recv(), Ok(ClientRequest::Input { session: input, data }) if input == session && data == b"x")
+    );
+    assert!(!view.term.as_ref().unwrap().exited);
+    assert!(view.peers[1].pending_attaches.is_empty());
+    assert!(local.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn errors_preserve_active_attachment_ownership() {
+    let (mut view, mut local, mut remote) = fixture();
+    view.attach();
+    local.try_recv().unwrap();
+    view.key(key('j'));
+    remote.try_recv().unwrap();
+    event(&mut view, 0, attach_error());
+    assert!(!view.term.as_ref().unwrap().exited);
+    view.peers[1].generation += 1;
+    view.message(Message {
+        peer: 1,
+        generation: 0,
+        event: Ok(attach_error()),
+    });
+    assert!(!view.term.as_ref().unwrap().exited);
+    event(
+        &mut view,
+        1,
+        ServerEvent::Error {
+            req_id: None,
+            message: "background warning".into(),
+        },
+    );
+    assert!(!view.term.as_ref().unwrap().exited);
+    event(
+        &mut view,
+        1,
+        ServerEvent::EntityUpserted {
+            entity: Entity::Terminal(terminal_row("second")),
+        },
+    );
+    view.focus = Focus::Sessions;
+    view.key(key('j'));
+    assert!(matches!(
+        remote.try_recv(),
+        Ok(ClientRequest::Detach { .. })
+    ));
+    assert!(matches!(
+        remote.try_recv(),
+        Ok(ClientRequest::Attach { .. })
+    ));
+    event(&mut view, 1, attach_error());
+    assert!(!view.term.as_ref().unwrap().exited);
+    event(&mut view, 1, attach_error());
+    assert!(view.term.as_ref().unwrap().exited);
+    assert_eq!(view.active_peer, Some(1));
+}
