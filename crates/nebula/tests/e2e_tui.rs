@@ -1145,10 +1145,14 @@ fn tui_remote_workspace_shows_the_other_machines_projects() {
 
     let stub_bin = tempfile::tempdir().unwrap();
     let ssh = stub_bin.path().join("ssh");
+    // Every invocation's arguments, one line each: the warm-up at boot
+    // and the link itself both come through here.
+    let ssh_calls = stub_bin.path().join("ssh-calls");
     std::fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nexec env {}={} {}={} {} relay\n",
+            "#!/bin/sh\necho \"$*\" >> {}\nexec env {}={} {}={} {} relay\n",
+            ssh_calls.display(),
             nebula_core::env::RUNTIME_DIR,
             remote.runtime_dir.display(),
             nebula_core::env::DATA_DIR,
@@ -1205,4 +1209,29 @@ fn tui_remote_workspace_shows_the_other_machines_projects() {
     tui.wait_for_text("local-app");
     tui.wait_for_gone("remote-etl");
     tui.wait_for_gone("⇄ fakebox");
+
+    // ---- the ssh is multiplexed, and warmed before the tab was picked ----
+    let calls = std::fs::read_to_string(&ssh_calls).unwrap();
+    let lines: Vec<&str> = calls.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "a warm-up at boot and the link itself, got {lines:?}"
+    );
+    let warm = lines[0];
+    assert!(
+        warm.ends_with("fakebox true"),
+        "the boot warm-up runs `true` through the master, got {warm:?}"
+    );
+    for line in &lines {
+        assert!(line.contains("-o BatchMode=yes"), "{line}");
+        assert!(line.contains("-o ControlMaster=auto"), "{line}");
+        assert!(line.contains("-o ControlPersist=1800"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "-o ControlPath={}/ssh-%C",
+                tui.runtime_dir.display()
+            )),
+            "the control socket lives in this instance's runtime dir: {line}"
+        );
+    }
 }

@@ -2429,6 +2429,10 @@ pub struct App {
     /// workspace switch there still scopes the connection it is about to
     /// get rather than opening another.
     pub link_lost: bool,
+    /// Whether to open ssh masters for bound hosts ahead of a switch (at
+    /// start, and when the switcher opens). Only the real loop sets it: a
+    /// test app must never spawn an ssh.
+    pub warm_ssh: bool,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2865,6 +2869,7 @@ impl App {
             term_locked: false,
             conn: ConnState::Disconnected,
             link_lost: false,
+            warm_ssh: false,
             hits: Vec::new(),
             term_area: Rect::default(),
             host_cursor: None,
