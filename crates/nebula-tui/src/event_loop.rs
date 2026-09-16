@@ -8408,8 +8408,8 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// Open a URL in the default browser via open(1) (this tool targets macOS).
-/// The scheme allowlist is defense in depth — the link scanner only ever
+/// Open a URL in the default browser: open(1) on macOS, the Windows default
+/// browser under WSL, xdg-open(1) elsewhere on Linux. The scheme allowlist is defense in depth — the link scanner only ever
 /// produces http(s) URLs, but the text originates from untrusted PTY output.
 pub(crate) fn open_url(url: &str) -> bool {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -8430,8 +8430,33 @@ pub(crate) fn open_url(url: &str) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        use std::process::{Command, Stdio};
+        // Under WSL, xdg-open usually has no browser to hand to; the Windows
+        // side does. rundll32 takes the URL as one argument, so a `&` in a
+        // query string isn't parsed the way `cmd.exe /c start` would.
+        let (program, args): (&str, &[&str]) = if is_wsl() {
+            ("rundll32.exe", &["url.dll,FileProtocolHandler"])
+        } else {
+            ("xdg-open", &[])
+        };
+        Command::new(program)
+            .args(args)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
+}
+
+/// Whether this Linux build runs inside WSL, where the browser lives on the
+/// Windows side.
+#[cfg(not(target_os = "macos"))]
+fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
 /// Two clicks on the same cell within this window make a double-click.
