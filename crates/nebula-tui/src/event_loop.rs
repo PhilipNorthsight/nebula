@@ -826,7 +826,9 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     app.pending_pr_detail = None;
     app.pending_issues_prefetch = None;
     app.pending_issue_detail = None;
-    if app.overlay.as_ref().is_some_and(context_bound_overlay) {
+    if matches!(&target, LinkTarget::Remote { .. })
+        || app.overlay.as_ref().is_some_and(context_bound_overlay)
+    {
         app.overlay = None;
     }
     match &target {
@@ -6492,6 +6494,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             });
         }
         PromptKind::NewWorkspace => {
+            if workspace_edits_blocked(app) {
+                return;
+            }
             // Created from the switcher: open it as soon as the Ack lands.
             send_with(app, out, PendingIntent::OpenCreatedWorkspace, |req_id| {
                 ClientRequest::AddWorkspace {
@@ -6501,6 +6506,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             });
         }
         PromptKind::RenameWorkspace { id } => {
+            if workspace_edits_blocked(app) {
+                return;
+            }
             send(app, out, |req_id| ClientRequest::RenameWorkspace {
                 req_id,
                 id,
@@ -6620,6 +6628,9 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             });
         }
         PendingAction::RemoveWorkspace { id, reopen_picker } => {
+            if workspace_edits_blocked(app) {
+                return;
+            }
             remove_workspace(app, id, out);
             // The switcher stays up across the delete, as it did before the
             // confirm: the EntityRemoved delta drops the row in place.
@@ -32442,6 +32453,94 @@ mod remote_lens_tests {
         .await;
 
         assert!(app.overlay.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_adoption_closes_a_new_workspace_prompt() {
+        let mut app = local_app();
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "New workspace",
+            "name",
+            "client",
+            PromptKind::NewWorkspace,
+        )));
+        app.link_generation = 1;
+        app.conn = ConnState::Connecting;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let mut channels = ipc::IpcChannels {
+            tx,
+            rx: erx,
+            link: None,
+        };
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let (_new_etx, new_erx) = tokio::sync::mpsc::channel(1);
+
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 1,
+                target: LinkTarget::Remote {
+                    host: "fm@motum".into(),
+                    env: Default::default(),
+                    workspace: ws("motum"),
+                    origin: ws("default"),
+                },
+                result: Ok(ipc::IpcChannels {
+                    tx: new_tx,
+                    rx: new_erx,
+                    link: None,
+                }),
+            },
+        )
+        .await;
+
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn workspace_mutations_cannot_submit_under_the_lens() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        let mut out = Vec::new();
+
+        submit_prompt(
+            &mut app,
+            PromptDialog::new("New workspace", "name", "client", PromptKind::NewWorkspace),
+            &mut out,
+        );
+        submit_prompt(
+            &mut app,
+            PromptDialog::new(
+                "Rename workspace",
+                "name",
+                "client",
+                PromptKind::RenameWorkspace { id: ws("default") },
+            ),
+            &mut out,
+        );
+        run_pending_action(
+            &mut app,
+            PendingAction::RemoveWorkspace {
+                id: ws("default"),
+                reopen_picker: None,
+            },
+            &mut out,
+        );
+
+        assert!(out.iter().all(|request| !matches!(
+            request,
+            ClientRequest::AddWorkspace { .. }
+                | ClientRequest::RenameWorkspace { .. }
+                | ClientRequest::RemoveWorkspace { .. }
+        )));
+        assert!(app.flash.as_deref().unwrap().contains("local tab"));
     }
 
     #[test]
