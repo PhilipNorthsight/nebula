@@ -40,6 +40,7 @@ pub mod tree_browser;
 pub mod ui;
 pub mod update_check;
 pub mod vim_term;
+pub mod workspace_hosts;
 
 use anyhow::Result;
 
@@ -113,9 +114,15 @@ pub fn run_add_project(path: String) -> Result<()> {
 
 pub use ipc::{RenameMode, WorkspaceOp};
 
-/// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
+/// `nebula workspace <add|open|list|delete|rename|host>` (see `ipc::run_workspace_op`).
 pub fn run_workspace(op: WorkspaceOp) -> Result<()> {
     runtime()?.block_on(ipc::run_workspace_op(op))
+}
+
+/// `nebula relay`: the far end of a REMOTE WORKSPACE — this machine's
+/// daemon socket over stdio (see `ipc::relay_stdio`).
+pub fn run_relay() -> Result<()> {
+    runtime()?.block_on(ipc::relay_stdio())
 }
 
 /// `nebula kill`.

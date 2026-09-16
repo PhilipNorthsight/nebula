@@ -237,6 +237,8 @@ pub enum MenuAction {
     NewWorkspace,
     RenameWorkspace(WorkspaceId),
     RemoveWorkspace(WorkspaceId),
+    /// Bind the workspace to an ssh host, or unbind it (`workspace_hosts`).
+    WorkspaceHost(WorkspaceId),
     ToggleArchived,
     /// Fold / unfold the PROJECT OPEN PRS GROUP (Worktrees panel menu).
     ToggleOpenPrs,
@@ -614,6 +616,11 @@ pub enum PromptKind {
     /// Name for a workspace created from the switcher; opened on Ack.
     NewWorkspace,
     RenameWorkspace {
+        id: WorkspaceId,
+    },
+    /// The ssh destination a workspace shows the projects of — `h` in the
+    /// switcher. Empty unbinds; a change to the open tab reconnects.
+    WorkspaceHost {
         id: WorkspaceId,
     },
     /// Rewrite a pinned link's URL.
@@ -1524,6 +1531,62 @@ impl PendingIntent {
 pub enum ConnState {
     Connected,
     Disconnected,
+    /// A REMOTE WORKSPACE link is being made (or the way back to the local
+    /// daemon): the old connection still stands until the new one answers.
+    Connecting,
+}
+
+/// A REMOTE WORKSPACE on screen: the tree is another machine's daemon's,
+/// reached over ssh (`ipc::connect_remote`), shown under one of this
+/// machine's workspaces. The Workspaces bar stays local — it is the list of
+/// tabs, and the tabs are where the machines are switched — while every
+/// project, worktree and session under it is the remote's, rewritten on
+/// the way in so the panels scope to the open tab as they always do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLens {
+    /// The ssh destination, as bound in `workspace_hosts.json`.
+    pub host: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The local workspace standing in for that machine: the open tab, and
+    /// what every remote project's `workspace_id` becomes.
+    pub workspace: WorkspaceId,
+    /// The remote daemon's own open workspace — the one whose projects
+    /// show. Known from its Snapshot on.
+    pub remote_workspace: Option<WorkspaceId>,
+}
+
+/// Where the event loop points the daemon connection next: set by a
+/// workspace switch that crosses machines, taken by the loop, which
+/// connects off the loop and swaps the channels when the far end answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// Back to this machine's daemon, landing on `workspace`.
+    Local {
+        workspace: WorkspaceId,
+        origin: WorkspaceId,
+    },
+    /// To `host`'s daemon, shown under `workspace`, with `env` exported on
+    /// the remote before its nebula runs (see `workspace_hosts`).
+    Remote {
+        host: String,
+        env: std::collections::BTreeMap<String, String>,
+        workspace: WorkspaceId,
+        origin: WorkspaceId,
+    },
+}
+
+impl LinkTarget {
+    pub fn workspace(&self) -> &WorkspaceId {
+        match self {
+            LinkTarget::Local { workspace, .. } | LinkTarget::Remote { workspace, .. } => workspace,
+        }
+    }
+
+    pub fn origin(&self) -> &WorkspaceId {
+        match self {
+            LinkTarget::Local { origin, .. } | LinkTarget::Remote { origin, .. } => origin,
+        }
+    }
 }
 
 /// One row of the Sessions panel's PULL REQUESTS group: a previously saved
@@ -2360,6 +2423,12 @@ pub struct App {
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
     pub term_locked: bool,
     pub conn: ConnState,
+    /// The daemon connection on screen went away after it had answered —
+    /// set by the loop when the channel closes, cleared when a link lands.
+    /// A fresh App is Disconnected too, but nothing was lost yet, so a
+    /// workspace switch there still scopes the connection it is about to
+    /// get rather than opening another.
+    pub link_lost: bool,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2380,6 +2449,23 @@ pub struct App {
     /// after teardown the binary execs `nebula ssh` at it, replacing this
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
+    /// The REMOTE WORKSPACE on screen, when the open tab is bound to
+    /// another machine and its daemon is the one connected.
+    pub remote: Option<RemoteLens>,
+    /// A connection change the loop has yet to start (see `LinkTarget`).
+    pub pending_link: Option<LinkTarget>,
+    /// Counts link attempts, so an answer from one the user already moved
+    /// on from is dropped rather than adopted.
+    pub link_generation: u64,
+    pub live_workspace: Option<WorkspaceId>,
+    /// The workspace to land on when the next local Snapshot arrives — the
+    /// tab the user picked while a remote was showing, which the daemon's
+    /// remembered default must not override.
+    pub link_workspace: Option<WorkspaceId>,
+    /// `workspace_hosts.json`, read once at start and after every edit, so
+    /// the bar and the switcher can mark bound tabs without a file read per
+    /// frame.
+    pub workspace_hosts: crate::workspace_hosts::Bindings,
     pub flash: Option<String>,
     /// The newest release published on GitHub (`0.22.0`) when it is newer
     /// than this build — the footer's `⇡ v0.22.0` beside the version
@@ -2778,12 +2864,19 @@ impl App {
             term_cache: Vec::new(),
             term_locked: false,
             conn: ConnState::Disconnected,
+            link_lost: false,
             hits: Vec::new(),
             term_area: Rect::default(),
             host_cursor: None,
             dirty: true,
             should_quit: false,
             pending_ssh: None,
+            remote: None,
+            pending_link: None,
+            link_generation: 0,
+            live_workspace: None,
+            link_workspace: None,
+            workspace_hosts: Default::default(),
             flash: None,
             update_available: None,
             edge_tap: None,

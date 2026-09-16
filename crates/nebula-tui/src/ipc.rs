@@ -95,18 +95,38 @@ async fn handshake(mut stream: UnixStream) -> Result<Connection> {
     // Asked of the kernel before the daemon gets a word in: a daemon on
     // another protocol hangs up right after its answer.
     let listener_pid = peer_pid(&stream);
+    let (mut reader, mut writer) = stream.split();
+    let daemon_pid = hello(&mut reader, &mut writer, |version| {
+        version_skew_message(version, listener_pid)
+    })
+    .await?;
+    Ok(Connection { stream, daemon_pid })
+}
+
+/// The version handshake itself, over any pair of halves: the local socket,
+/// or the stdio of an ssh whose far end is `nebula relay`. `skew` words the
+/// refusal, since which fix applies depends on where the daemon is.
+async fn hello<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    skew: impl FnOnce(u32) -> String,
+) -> Result<u32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     write_frame(
-        &mut stream,
+        writer,
         &ClientRequest::Hello {
             protocol_version: PROTOCOL_VERSION,
         },
     )
     .await?;
-    match read_frame::<ServerEvent, _>(&mut stream).await? {
-        Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
+    match read_frame::<ServerEvent, _>(reader).await? {
+        Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(daemon_pid),
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
-        }) => bail!(version_skew_message(daemon_protocol_version, listener_pid)),
+        }) => bail!(skew(daemon_protocol_version)),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
 }
@@ -194,10 +214,28 @@ fn daemon_exe_path(pid: i32) -> Option<String> {
 pub struct IpcChannels {
     pub tx: tokio::sync::mpsc::Sender<ClientRequest>,
     pub rx: tokio::sync::mpsc::Receiver<ServerEvent>,
+    /// The ssh carrying a REMOTE WORKSPACE's connection, kept so the far
+    /// end lives exactly as long as these channels: dropping them (a switch
+    /// back to a local workspace, or quitting) kills ssh, which ends the
+    /// `nebula relay` on the remote — and nothing else there, the daemon
+    /// least of all. None for the local socket.
+    pub link: Option<tokio::process::Child>,
 }
 
 pub fn split_connection(conn: Connection) -> IpcChannels {
-    let (read_half, mut write_half) = conn.stream.into_split();
+    let (read_half, write_half) = conn.stream.into_split();
+    split_halves(read_half, write_half, None)
+}
+
+fn split_halves<R, W>(
+    read_half: R,
+    mut write_half: W,
+    link: Option<tokio::process::Child>,
+) -> IpcChannels
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ServerEvent>(1024);
     let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<ClientRequest>(256);
 
@@ -222,7 +260,197 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     IpcChannels {
         tx: req_tx,
         rx: event_rx,
+        link,
     }
+}
+
+/// Connect to the daemon on another machine, for a REMOTE WORKSPACE: one
+/// `ssh host` whose remote command is the self-installing prelude every
+/// `nebula ssh` uses, tailed with `nebula relay` — which connects to (or
+/// spawns) the daemon there and pipes its socket over ssh's stdio. The
+/// handshake then runs end to end, so what answers is that daemon itself,
+/// and a protocol mismatch reads as one.
+///
+/// BatchMode: the TUI owns the terminal, so ssh must never prompt — a key
+/// that needs a passphrase wants an agent, and an unknown host key wants a
+/// `ssh host` by hand first. Its stderr is collected off the pipe, not the
+/// screen, and the error names the last of it when the connection fails.
+///
+/// Settings deliberately do not ride along (as they do for `nebula ssh`):
+/// nothing on the far end renders, so the remote's own settings are the
+/// ones that matter there, and this side's keep applying to the screen.
+pub async fn connect_remote(
+    host: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<IpcChannels> {
+    let cmd = relay_command(&nebula_core::remote_script::install_url(), env);
+    let mut child = tokio::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-T", "--", host, &cmd])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("ssh not found on PATH — remote workspaces need the OpenSSH client")
+            } else {
+                anyhow::Error::from(e).context("failed to spawn ssh")
+            }
+        })?;
+    let mut writer = child.stdin.take().context("ssh stdin")?;
+    let mut reader = child.stdout.take().context("ssh stdout")?;
+    let stderr = child.stderr.take().context("ssh stderr")?;
+    // Whatever ssh and the remote script say — "installing...", a refused
+    // key, "too old" — is the diagnosis when the handshake fails.
+    let said = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(
+            &mut tokio::io::BufReader::new(stderr),
+            &mut text,
+        )
+        .await;
+        text
+    });
+    let handshake = tokio::time::timeout(
+        REMOTE_CONNECT_TIMEOUT,
+        hello(&mut reader, &mut writer, |version| {
+            remote_skew_message(host, version)
+        }),
+    );
+    match handshake.await {
+        Ok(Ok(_pid)) => {
+            // Keep draining stderr so a chatty ssh can't block on the pipe.
+            tokio::spawn(async move {
+                let _ = said.await;
+            });
+            Ok(split_halves(reader, writer, Some(child)))
+        }
+        Ok(Err(err)) => {
+            // Kill first, so the stderr collector sees EOF and returns.
+            let _ = child.kill().await;
+            let said = said.await.unwrap_or_default();
+            let said = last_lines(&said, 3);
+            if said.is_empty() {
+                Err(err.context(format!("{host}: connection failed")))
+            } else {
+                Err(err.context(format!("{host}: {said}")))
+            }
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let said = last_lines(&said.await.unwrap_or_default(), 3);
+            if said.is_empty() {
+                bail!(
+                    "{host}: no answer within {}s",
+                    REMOTE_CONNECT_TIMEOUT.as_secs()
+                )
+            } else {
+                bail!(
+                    "{host}: no answer within {}s — {said}",
+                    REMOTE_CONNECT_TIMEOUT.as_secs()
+                )
+            }
+        }
+    }
+}
+
+/// Long enough for a first connection to install nebula on a bare box.
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The tail of a stderr transcript, joined on one line for a flash.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" · ")
+}
+
+/// A remote on another protocol version gets a message about *that*
+/// machine — the local skew text's `nebula kill` advice would stop the
+/// wrong daemon.
+fn remote_skew_message(host: &str, daemon_protocol_version: u32) -> String {
+    let fix = if daemon_protocol_version > PROTOCOL_VERSION {
+        "upgrade nebula here".to_string()
+    } else {
+        format!("open it with `nebula ssh {host}` and run `nebula upgrade` there")
+    };
+    format!(
+        "{host} runs nebula protocol v{daemon_protocol_version}, this one v{PROTOCOL_VERSION} — {fix}"
+    )
+}
+
+/// Runs under `sh -c` on the remote: $1 = install URL, $2… = `NAME=value`
+/// pairs to export first (the binding's `env`), each one positional and
+/// single-quoted like the URL, so the script itself never carries a
+/// value. The `--help` probe is the version check, as in `nebula tunnel`:
+/// the prelude only installs nebula when the remote has none, so a box
+/// last touched a few releases ago has a nebula that predates `relay` and
+/// would fail on the unknown command with a clap usage dump. Naming the
+/// fix beats that.
+const RELAY_SCRIPT: &str = concat!(
+    nebula_core::install_prelude!(),
+    "shift; for kv in \"$@\"; do export \"$kv\"; done; ",
+    "nebula relay --help >/dev/null 2>&1 || { ",
+    "echo \"nebula: the nebula on this host is too old for remote workspaces; ",
+    "reach it with nebula ssh and run nebula upgrade there\" >&2; exit 1; }; ",
+    "exec nebula relay"
+);
+
+fn relay_command(install_url: &str, env: &std::collections::BTreeMap<String, String>) -> String {
+    use nebula_core::remote_script::shell_single_quote;
+    let mut cmd = format!(
+        "sh -c '{}' nebula-relay {}",
+        RELAY_SCRIPT,
+        shell_single_quote(install_url)
+    );
+    for (name, value) in env {
+        cmd.push(' ');
+        cmd.push_str(&shell_single_quote(&format!("{name}={value}")));
+    }
+    cmd
+}
+
+/// `nebula relay`, the far end of [`connect_remote`]: connect to this
+/// machine's daemon — spawning it when nothing is listening, exactly as the
+/// TUI would — and pipe the socket over stdin/stdout until either side
+/// hangs up. No handshake of its own: the frames are the client's, and the
+/// client is the one that needs the answer.
+pub async fn relay_stdio() -> Result<()> {
+    let sock = paths::socket_path();
+    let stream = match try_connect(&sock).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            spawn_daemon()?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                match try_connect(&sock).await {
+                    Ok(stream) => break stream,
+                    Err(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(POLL_STEP).await;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("daemon did not come up on {}", sock.display())
+                        })
+                    }
+                }
+            }
+        }
+    };
+    let (mut sock_rd, mut sock_wr) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    // Either direction closing ends the relay: the client hung up (ssh
+    // died, or the TUI switched away), or the daemon did.
+    tokio::select! {
+        r = tokio::io::copy(&mut stdin, &mut sock_wr) => { r.context("client → daemon")?; }
+        r = tokio::io::copy(&mut sock_rd, &mut stdout) => { r.context("daemon → client")?; }
+    }
+    Ok(())
 }
 
 /// The agent id a one-shot CLI runs as, from the raw `NEBULA_AGENT_ID`
@@ -527,11 +755,30 @@ pub async fn add_project(path: &str) -> Result<()> {
 /// daemon (spawned when absent, same as `nebula add`).
 #[derive(Debug, Clone)]
 pub enum WorkspaceOp {
-    Add { name: String },
-    Open { name: String },
+    Add {
+        name: String,
+    },
+    Open {
+        name: String,
+    },
     List,
-    Delete { name: String },
-    Rename { name: String, new_name: String },
+    Delete {
+        name: String,
+    },
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    /// Bind the workspace to an ssh destination (`None` unbinds) — see
+    /// `workspace_hosts`. Resolves the name against the daemon like the
+    /// others, then writes this machine's binding file. `env` is exported
+    /// on the remote before its nebula runs; given with no host, the
+    /// existing host is kept.
+    Host {
+        name: String,
+        host: Option<String>,
+        env: Vec<String>,
+    },
 }
 
 /// One-shot client for `nebula workspace …`. Name→id resolution runs off a
@@ -569,14 +816,57 @@ pub async fn run_workspace_op(op: WorkspaceOp) -> Result<()> {
     let req_id = ONE_SHOT_REQ_ID;
     let (request, done): (ClientRequest, String) = match op {
         WorkspaceOp::List => {
+            let bindings = crate::workspace_hosts::load();
             for w in &workspaces {
                 let marker = if w.id == active { "*" } else { " " };
                 let count = projects.iter().filter(|p| p.workspace_id == w.id).count();
+                let host = bindings
+                    .get(w.id.as_str())
+                    .map(|b| format!("  @{}", b.host()))
+                    .unwrap_or_default();
                 println!(
-                    "{marker} {}  ({count} project{})",
+                    "{marker} {}  ({count} project{}){host}",
                     w.name,
                     if count == 1 { "" } else { "s" }
                 );
+            }
+            return Ok(());
+        }
+        WorkspaceOp::Host { name, host, env } => {
+            use crate::workspace_hosts::{binding_for, parse_env, parse_host, Binding};
+            let id = resolve(&name)?;
+            let host = match host.as_deref() {
+                Some(text) => parse_host(text).map_err(|e| anyhow::anyhow!(e))?,
+                None => None,
+            };
+            let env = env
+                .iter()
+                .map(|kv| parse_env(kv).map_err(|e| anyhow::anyhow!(e)))
+                .collect::<Result<_>>()?;
+            // `--env` alone re-binds the current host with new variables;
+            // `--clear` (no host, no env) unbinds.
+            let binding = match (host, env) {
+                (Some(host), env) => Some(Binding::new(host, env)),
+                (None, env) if !env.is_empty() => {
+                    let current = binding_for(&id).with_context(|| {
+                        format!("workspace '{name}' is not bound — name the host as well")
+                    })?;
+                    Some(Binding::new(current.host().to_string(), env))
+                }
+                (None, _) => None,
+            };
+            crate::workspace_hosts::set(&id, binding.as_ref())
+                .context("failed to write workspace_hosts.json")?;
+            match binding {
+                Some(b) if b.env().is_empty() => {
+                    println!("workspace '{name}' now shows {}'s projects", b.host())
+                }
+                Some(b) => println!(
+                    "workspace '{name}' now shows {}'s projects, with {} exported there first",
+                    b.host(),
+                    b.env().keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                None => println!("workspace '{name}' is local again"),
             }
             return Ok(());
         }
@@ -814,6 +1104,85 @@ fn send_signal(pid: i32, sig: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relay script rides inside one pair of single quotes on the
+    /// remote's login shell, so it can hold none of its own — and it has
+    /// to name the fix when the remote's nebula predates `relay`.
+    #[test]
+    fn relay_script_survives_single_quoting_and_names_the_upgrade() {
+        assert!(!RELAY_SCRIPT.contains('\''));
+        assert!(!RELAY_SCRIPT.contains('\\'));
+        assert!(!RELAY_SCRIPT.contains('\n'));
+        assert!(RELAY_SCRIPT.ends_with("exec nebula relay"));
+        assert!(RELAY_SCRIPT.contains("nebula upgrade"));
+        let cmd = relay_command("https://example.com/it's.sh", &Default::default());
+        assert!(cmd.starts_with("sh -c '"), "{cmd}");
+        assert!(
+            cmd.ends_with("nebula-relay 'https://example.com/it'\\''s.sh'"),
+            "{cmd}"
+        );
+    }
+
+    /// Which side is stale decides the advice, and it is about the remote
+    /// machine — never `nebula kill`, which would stop the local daemon.
+    #[test]
+    fn remote_skew_message_points_at_the_right_machine() {
+        let older = remote_skew_message("fm@box", PROTOCOL_VERSION - 1);
+        assert!(older.contains("fm@box"), "{older}");
+        assert!(older.contains("nebula ssh fm@box"), "{older}");
+        assert!(older.contains("nebula upgrade"), "{older}");
+        assert!(!older.contains("nebula kill"), "{older}");
+        let newer = remote_skew_message("fm@box", PROTOCOL_VERSION + 1);
+        assert!(newer.contains("upgrade nebula here"), "{newer}");
+    }
+
+    /// The binding's variables ride as positional parameters after the
+    /// URL, one quoted word each, and the script exports them before
+    /// nebula runs — run the way sshd runs it, with a stub `nebula` that
+    /// records what it saw.
+    #[test]
+    fn the_relay_script_exports_the_bindings_env_before_nebula_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let stub = home.path().join("stub");
+        std::fs::create_dir(&stub).unwrap();
+        let nebula = stub.join("nebula");
+        std::fs::write(
+            &nebula,
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"${NEBULA_DATA_DIR-unset}\" \"${SPACED-unset}\" > \"$SEEN\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&nebula, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let seen = home.path().join("seen");
+        let env: std::collections::BTreeMap<String, String> = [
+            ("NEBULA_DATA_DIR".to_string(), "/srv/it's".to_string()),
+            ("SPACED".to_string(), "a b".to_string()),
+        ]
+        .into();
+        let cmd = relay_command("file:///nonexistent", &env);
+        let status = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("HOME", home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+            .env("SEEN", &seen)
+            .env_remove("NEBULA_DATA_DIR")
+            .status()
+            .expect("sh");
+        assert!(status.success());
+        // The stub answers `--help` and the real run alike; the last write
+        // is the `exec nebula relay`, whose $1 is `relay`.
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "relay|/srv/it's|a b"
+        );
+    }
+
+    #[test]
+    fn last_lines_keeps_the_tail_on_one_line() {
+        assert_eq!(last_lines("", 3), "");
+        assert_eq!(last_lines("a\n\n  b  \nc\nd\n", 3), "b · c · d");
+        assert_eq!(last_lines("only", 3), "only");
+    }
 
     // Unset and empty are the same miss, and the error has to name the
     // command the model just ran so it knows why it can't work here.
