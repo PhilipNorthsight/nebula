@@ -790,6 +790,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     app.attached_sref = None;
     app.pending_attach = None;
     app.pending_prewarm = None;
+    app.git_changes = None;
     app.git_changes_inflight = None;
     match &target {
         LinkTarget::Remote {
@@ -1035,6 +1036,11 @@ fn request_git_changes(
     app: &mut App,
     git_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<usize>)>,
 ) {
+    if app.remote.is_some() {
+        app.git_changes = None;
+        app.git_changes_inflight = None;
+        return;
+    }
     if app.git_changes_inflight.is_some() {
         return;
     }
@@ -1057,6 +1063,10 @@ fn request_git_changes(
 /// selected — and a value change redraws.
 fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
     app.git_changes_inflight = None;
+    if app.remote.is_some() {
+        app.git_changes = None;
+        return;
+    }
     let next = Some((worktree, count));
     if app.git_changes != next {
         app.git_changes = next;
@@ -32210,6 +32220,29 @@ mod remote_lens_tests {
         // The bindings prompt itself is fine from anywhere.
         open_prompt(&mut app, PromptKind::WorkspaceHost { id: ws("motum") });
         assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "fm@motum"));
+    }
+
+    #[test]
+    fn remote_redraw_does_not_read_or_show_local_git_changes() {
+        let mut app = local_app();
+        seed_tree(&mut app);
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        app.git_changes = Some((WorktreeId("w2".into()), Some(3)));
+        let (git_tx, mut git_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(app.git_changes_stale());
+        if app.git_changes_stale() {
+            request_git_changes(&mut app, &git_tx);
+        }
+
+        assert!(app.git_changes.is_none());
+        assert!(app.git_changes_inflight.is_none());
+        assert!(git_rx.try_recv().is_err());
     }
 
     /// The switcher's `h`: the binding is written, the cache refreshed, and
