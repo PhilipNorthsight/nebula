@@ -812,6 +812,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     };
     *channels = new;
     app.conn = ConnState::Connected;
+    app.link_lost = false;
     app.live_workspace = Some(target.workspace().clone());
     // The pane's session is on the machine we just left; its parser and
     // cache go with it.
@@ -951,8 +952,10 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
             true
         }
         (None, None) => {
-            if app.conn == ConnState::Disconnected
-                || (app.conn == ConnState::Connecting && app.live_workspace.is_none())
+            // Only a connection that was up and went away needs a new one;
+            // a fresh App is Disconnected until its first Snapshot and
+            // scopes the connection it is about to get, as it always did.
+            if app.link_lost || (app.conn == ConnState::Connecting && app.live_workspace.is_none())
             {
                 app.pending_link = Some(LinkTarget::Local {
                     workspace: workspace.clone(),
@@ -2247,6 +2250,7 @@ fn connection_lost(app: &mut App) {
         return;
     }
     app.conn = ConnState::Disconnected;
+    app.link_lost = true;
     app.flash = Some(match &app.remote {
         Some(lens) => format!(
             "lost the connection to {} — `w` to a local workspace, or back here to reconnect",
@@ -32069,6 +32073,7 @@ mod remote_lens_tests {
             name: "Other".into(),
         });
         app.conn = ConnState::Disconnected;
+        app.link_lost = true;
         app.remote = None;
         app.live_workspace = Some(ws("default"));
         let mut out = Vec::new();

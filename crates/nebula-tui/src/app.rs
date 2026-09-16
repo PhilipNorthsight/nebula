@@ -2423,6 +2423,12 @@ pub struct App {
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
     pub term_locked: bool,
     pub conn: ConnState,
+    /// The daemon connection on screen went away after it had answered —
+    /// set by the loop when the channel closes, cleared when a link lands.
+    /// A fresh App is Disconnected too, but nothing was lost yet, so a
+    /// workspace switch there still scopes the connection it is about to
+    /// get rather than opening another.
+    pub link_lost: bool,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2858,6 +2864,7 @@ impl App {
             term_cache: Vec::new(),
             term_locked: false,
             conn: ConnState::Disconnected,
+            link_lost: false,
             hits: Vec::new(),
             term_area: Rect::default(),
             host_cursor: None,
