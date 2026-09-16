@@ -2451,6 +2451,7 @@ pub struct App {
     /// Counts link attempts, so an answer from one the user already moved
     /// on from is dropped rather than adopted.
     pub link_generation: u64,
+    pub live_workspace: Option<WorkspaceId>,
     /// The workspace to land on when the next local Snapshot arrives — the
     /// tab the user picked while a remote was showing, which the daemon's
     /// remembered default must not override.
@@ -2866,6 +2867,7 @@ impl App {
             remote: None,
             pending_link: None,
             link_generation: 0,
+            live_workspace: None,
             link_workspace: None,
             workspace_hosts: Default::default(),
             flash: None,
