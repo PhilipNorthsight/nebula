@@ -573,12 +573,12 @@ async fn main_loop(
             }
             answer = issues_rx.recv() => {
                 if let Some(answer) = answer {
-                    crate::issues::land_answer(&mut app, answer);
+                    land_issues_answer(&mut app, answer);
                 }
             }
             answer = branch_rx.recv() => {
                 if let Some(answer) = answer {
-                    crate::branch_switch::land_answer(&mut app, answer);
+                    land_branch_answer(&mut app, answer);
                 }
             }
         }
@@ -757,16 +757,19 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
             app.tree.active_workspace = origin.clone();
             app.sel_project = 0;
             restore_workspace_project(app);
-            let daemon_workspace = app
-                .remote
-                .as_ref()
-                .and_then(|lens| lens.remote_workspace.clone())
-                .unwrap_or(origin);
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            let mut out = vec![ClientRequest::OpenWorkspace {
-                req_id,
-                id: daemon_workspace,
-            }];
+            let mut out = match app.remote.as_ref() {
+                Some(lens) => match lens.remote_workspace.clone() {
+                    Some(id) => {
+                        let req_id = app.alloc_req_id(PendingIntent::None);
+                        vec![ClientRequest::OpenWorkspace { req_id, id }]
+                    }
+                    None => vec![ClientRequest::Subscribe],
+                },
+                None => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    vec![ClientRequest::OpenWorkspace { req_id, id: origin }]
+                }
+            };
             restore_context(app, &mut out);
             sync_pty_size(app, &mut out);
             clamp_selections(app);
@@ -1074,7 +1077,7 @@ fn request_git_changes(
 /// selected — and a value change redraws.
 fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
     app.git_changes_inflight = None;
-    if app.remote.is_some() {
+    if local_lookup_landing_blocked(app) {
         app.git_changes = None;
         return;
     }
@@ -1083,6 +1086,49 @@ fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
         app.git_changes = next;
         app.dirty = true;
     }
+}
+
+fn local_lookup_landing_blocked(app: &App) -> bool {
+    app.remote.is_some() || app.conn == ConnState::Connecting || app.pending_link.is_some()
+}
+
+fn land_issues_answer(app: &mut App, answer: crate::issues::IssuesAnswer) {
+    if local_lookup_landing_blocked(app) {
+        match &answer {
+            crate::issues::IssuesAnswer::List { project, .. } => {
+                app.issues_inflight.remove(project);
+            }
+            crate::issues::IssuesAnswer::Detail { url, .. } => {
+                app.issue_detail_inflight.remove(url);
+            }
+            crate::issues::IssuesAnswer::Comment { issue, .. } => {
+                app.issue_comment_inflight.remove(&issue.url);
+            }
+            crate::issues::IssuesAnswer::Edited { .. } => {}
+        }
+        return;
+    }
+    crate::issues::land_answer(app, answer);
+}
+
+fn land_branch_answer(app: &mut App, answer: crate::branch_switch::Answer) {
+    if local_lookup_landing_blocked(app) {
+        match &answer {
+            crate::branch_switch::Answer::Listed { .. } => {}
+            crate::branch_switch::Answer::Changes { worktree, .. } => {
+                app.branch_switch.listing.remove(worktree);
+                app.branch_switch.relist.remove(worktree);
+            }
+            crate::branch_switch::Answer::Fetched { worktree, .. } => {
+                app.branch_switch.fetching.remove(worktree);
+            }
+            crate::branch_switch::Answer::Switched { worktree, .. } => {
+                app.branch_switch.switching.remove(worktree);
+            }
+        }
+        return;
+    }
+    crate::branch_switch::land_answer(app, answer);
 }
 
 /// The two halves above in one synchronous step, for tests of the badge.
@@ -1214,6 +1260,9 @@ fn note_pr_answer(app: &mut App, worktree: &WorktreeId, found: bool) {
 /// goes to the cache at the next flush.
 fn land_pull_request(app: &mut App, worktree: WorktreeId, answer: Lookup) {
     app.pr_inflight.remove(&worktree);
+    if local_lookup_landing_blocked(app) {
+        return;
+    }
     let row = match answer {
         Lookup::Found(pr) => Some(Some(pr)),
         Lookup::Absent => Some(None),
@@ -1330,6 +1379,10 @@ fn note_open_prs_answer(
     list: Option<Vec<crate::pull_request::OpenPr>>,
     out: &mut Vec<ClientRequest>,
 ) {
+    app.open_prs_inflight.remove(&project);
+    if local_lookup_landing_blocked(app) {
+        return;
+    }
     // Which pull request the cursor is resting on, before the list under it
     // changes. A refresh that retires a merged PR must not slide the
     // selection onto whatever row inherits its index.
@@ -1338,7 +1391,6 @@ fn note_open_prs_answer(
     // just opened from its branch (or back out, once that merges), and
     // the cursor goes with it — a checkout is never lost to a re-list.
     let checkout = app.selected_worktree().map(|w| w.id.clone());
-    app.open_prs_inflight.remove(&project);
     let previous = app.open_prs.get(&project);
     let found = list.as_ref().is_some_and(|l| !l.is_empty());
     let step = if found {
@@ -1622,6 +1674,9 @@ fn land_pr_detail(
     out: &mut Vec<ClientRequest>,
 ) {
     app.pr_detail_inflight.remove(&url);
+    if local_lookup_landing_blocked(app) {
+        return;
+    }
     match detail {
         Some(detail) => {
             let retired = !detail.is_open();
@@ -1733,6 +1788,9 @@ fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
         result,
     } = answer;
     app.pr_comment_inflight.remove(&url);
+    if local_lookup_landing_blocked(app) {
+        return;
+    }
     match result {
         Ok(_) => {
             app.flash = Some(format!("comment posted on #{number}"));
@@ -1824,15 +1882,19 @@ fn land_pr_diff(app: &mut App, answer: PrDiffAnswer) {
         title,
         diff,
     } = answer;
+    if app.pr_diff_inflight == Some(number) {
+        app.pr_diff_inflight = None;
+    }
+    let refreshing = app.pr_diff_refreshing.remove(&url);
+    if local_lookup_landing_blocked(app) {
+        return;
+    }
     if let Some(diff) = &diff {
         crate::pr_cache::remember_diff(app, &url, diff);
     }
-    if !app.pr_diff_refreshing.remove(&url) {
+    if !refreshing {
         open_pr_diff_view(app, number, &url, title, diff);
         return;
-    }
-    if app.pr_diff_inflight == Some(number) {
-        app.pr_diff_inflight = None;
     }
     // A fetch that failed leaves the cached copy on screen: it was the best
     // answer there was when `g` was pressed, and still is.
@@ -32442,6 +32504,81 @@ mod remote_lens_tests {
 
         assert!(out.is_empty());
         assert!(app.flash.as_deref().unwrap().contains("fm@motum"));
+    }
+
+    #[test]
+    fn a_local_pr_diff_answer_is_discarded_under_the_lens() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        app.pr_diff_inflight = Some(7);
+        app.pr_diff_refreshing
+            .insert("https://github.com/o/r/pull/7".into());
+
+        land_pr_diff(
+            &mut app,
+            PrDiffAnswer {
+                number: 7,
+                url: "https://github.com/o/r/pull/7".into(),
+                title: "#7 Attach links".into(),
+                diff: Some("diff --git a/a b/a\n".into()),
+            },
+        );
+
+        assert!(app.pr_diff_inflight.is_none());
+        assert!(app.pr_diff_refreshing.is_empty());
+        assert!(app.overlay.is_none());
+        assert!(app.flash.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_link_refreshes_a_retained_lens_without_a_workspace() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: None,
+        });
+        app.live_workspace = Some(ws("motum"));
+        app.link_generation = 1;
+        app.conn = ConnState::Connecting;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let mut channels = ipc::IpcChannels {
+            tx,
+            rx: erx,
+            link: None,
+        };
+
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 1,
+                target: LinkTarget::Local {
+                    workspace: ws("default"),
+                    origin: ws("motum"),
+                },
+                result: Err("local unavailable".into()),
+            },
+        )
+        .await;
+
+        let mut requests = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            requests.push(request);
+        }
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request, ClientRequest::Subscribe)));
+        assert!(requests
+            .iter()
+            .all(|request| !matches!(request, ClientRequest::OpenWorkspace { .. })));
     }
 
     #[test]
