@@ -1546,6 +1546,7 @@ pub enum ConnState {
 pub struct RemoteLens {
     /// The ssh destination, as bound in `workspace_hosts.json`.
     pub host: String,
+    pub env: std::collections::BTreeMap<String, String>,
     /// The local workspace standing in for that machine: the open tab, and
     /// what every remote project's `workspace_id` becomes.
     pub workspace: WorkspaceId,
@@ -1560,20 +1561,30 @@ pub struct RemoteLens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkTarget {
     /// Back to this machine's daemon, landing on `workspace`.
-    Local { workspace: WorkspaceId },
+    Local {
+        workspace: WorkspaceId,
+        origin: WorkspaceId,
+    },
     /// To `host`'s daemon, shown under `workspace`, with `env` exported on
     /// the remote before its nebula runs (see `workspace_hosts`).
     Remote {
         host: String,
         env: std::collections::BTreeMap<String, String>,
         workspace: WorkspaceId,
+        origin: WorkspaceId,
     },
 }
 
 impl LinkTarget {
     pub fn workspace(&self) -> &WorkspaceId {
         match self {
-            LinkTarget::Local { workspace } | LinkTarget::Remote { workspace, .. } => workspace,
+            LinkTarget::Local { workspace, .. } | LinkTarget::Remote { workspace, .. } => workspace,
+        }
+    }
+
+    pub fn origin(&self) -> &WorkspaceId {
+        match self {
+            LinkTarget::Local { origin, .. } | LinkTarget::Remote { origin, .. } => origin,
         }
     }
 }

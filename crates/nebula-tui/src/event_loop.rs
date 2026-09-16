@@ -756,6 +756,28 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
             } else {
                 ConnState::Connected
             };
+            let origin = target.origin().clone();
+            remember_context(app);
+            app.tree.active_workspace = origin.clone();
+            app.sel_project = 0;
+            restore_workspace_project(app);
+            let daemon_workspace = app
+                .remote
+                .as_ref()
+                .and_then(|lens| lens.remote_workspace.clone())
+                .unwrap_or(origin);
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            let mut out = vec![ClientRequest::OpenWorkspace {
+                req_id,
+                id: daemon_workspace,
+            }];
+            restore_context(app, &mut out);
+            clamp_selections(app);
+            refresh_palette(app);
+            refresh_workspace_picker(app);
+            for request in out {
+                let _ = channels.tx.send(request).await;
+            }
             app.flash = Some(err);
             app.dirty = true;
             return;
@@ -771,10 +793,14 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     app.git_changes_inflight = None;
     match &target {
         LinkTarget::Remote {
-            host, workspace, ..
+            host,
+            env,
+            workspace,
+            ..
         } => {
             app.remote = Some(crate::app::RemoteLens {
                 host: host.clone(),
+                env: env.clone(),
                 workspace: workspace.clone(),
                 remote_workspace: None,
             });
@@ -788,7 +814,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
             app.tree.links.clear();
             app.flash = Some(format!("{host}: connected"));
         }
-        LinkTarget::Local { workspace } => {
+        LinkTarget::Local { workspace, .. } => {
             app.remote = None;
             app.link_workspace = Some(workspace.clone());
             app.flash = None;
@@ -800,7 +826,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     }
     // Scope the local connection the way the switch would have, so
     // AddProject files under the picked tab and the daemon remembers it.
-    if let LinkTarget::Local { workspace } = &target {
+    if let LinkTarget::Local { workspace, .. } = &target {
         let req_id = app.alloc_req_id(PendingIntent::None);
         let _ = channels
             .tx
@@ -817,15 +843,21 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
 /// bound host, or this one — when that is not where it already points.
 /// True when a link was queued (the caller then leaves the daemon's
 /// OpenWorkspace to `adopt_link`).
-fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
+fn request_link_for(app: &mut App, workspace: &WorkspaceId, origin: &WorkspaceId) -> bool {
     let binding = app.workspace_hosts.get(workspace.as_str()).cloned();
     match (binding, app.remote.clone()) {
         // A bound tab, and its machine is not the one connected.
-        (Some(binding), lens) if lens.as_ref().map(|l| l.host.as_str()) != Some(binding.host()) => {
+        (Some(binding), lens)
+            if app.conn == ConnState::Disconnected
+                || lens.as_ref().is_none_or(|lens| {
+                    lens.host != binding.host() || &lens.env != binding.env()
+                }) =>
+        {
             app.pending_link = Some(LinkTarget::Remote {
                 host: binding.host().to_string(),
                 env: binding.env().clone(),
                 workspace: workspace.clone(),
+                origin: origin.clone(),
             });
             true
         }
@@ -847,10 +879,17 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
         (None, Some(_)) => {
             app.pending_link = Some(LinkTarget::Local {
                 workspace: workspace.clone(),
+                origin: origin.clone(),
             });
             true
         }
-        (None, None) => false,
+        (None, None) => {
+            if app.pending_link.take().is_some() || app.conn == ConnState::Connecting {
+                app.link_generation += 1;
+                app.conn = ConnState::Connected;
+            }
+            false
+        }
     }
 }
 
@@ -4404,8 +4443,12 @@ fn switch_workspace_inner(
     out: &mut Vec<ClientRequest>,
 ) -> bool {
     if app.tree.active_workspace == id {
+        if app.conn == ConnState::Disconnected && app.workspace_hosts.contains_key(id.as_str()) {
+            return request_link_for(app, &id, &id);
+        }
         return false;
     }
+    let origin = app.tree.active_workspace.clone();
     remember_context(app);
     app.tree.active_workspace = id.clone();
     app.sel_project = 0;
@@ -4424,7 +4467,7 @@ fn switch_workspace_inner(
     // A tab on another machine (or back from one) changes the daemon the
     // requests go to; the loop makes that connection and scopes it. Only a
     // tab on the daemon already connected is scoped here and now.
-    if !request_link_for(app, &id) {
+    if !request_link_for(app, &id, &origin) {
         send(app, out, |req_id| ClientRequest::OpenWorkspace {
             req_id,
             id,
@@ -4578,7 +4621,7 @@ fn bind_workspace_host(app: &mut App, id: WorkspaceId, value: &str) {
     // already connected: nothing to reconnect, and the daemon's scope is
     // unchanged either way.
     if app.tree.active_workspace == id {
-        request_link_for(app, &id);
+        request_link_for(app, &id, &id);
     }
 }
 
@@ -9082,7 +9125,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // restart.
             let active = app.tree.active_workspace.clone();
             if app.workspace_hosts.contains_key(active.as_str()) {
-                request_link_for(app, &active);
+                request_link_for(app, &active, &active);
             }
             let session_restored = ui_state
                 .as_deref()
@@ -31380,6 +31423,7 @@ mod remote_lens_tests {
         app.tree.active_workspace = ws("motum");
         app.remote = Some(RemoteLens {
             host: "fm@motum".into(),
+            env: Default::default(),
             workspace: ws("motum"),
             remote_workspace: None,
         });
@@ -31426,6 +31470,7 @@ mod remote_lens_tests {
         app.tree.active_workspace = ws("motum");
         app.remote = Some(RemoteLens {
             host: "fm@motum".into(),
+            env: Default::default(),
             workspace: ws("motum"),
             remote_workspace: None,
         });
@@ -31473,6 +31518,7 @@ mod remote_lens_tests {
         app.tree.active_workspace = ws("motum");
         app.remote = Some(RemoteLens {
             host: "fm@motum".into(),
+            env: Default::default(),
             workspace: ws("motum"),
             remote_workspace: Some(ws("r-default")),
         });
@@ -31533,6 +31579,7 @@ mod remote_lens_tests {
                 host: "fm@motum".into(),
                 env: Default::default(),
                 workspace: ws("motum"),
+                origin: ws("default"),
             })
         );
         assert!(
@@ -31545,6 +31592,7 @@ mod remote_lens_tests {
         app.pending_link = None;
         app.remote = Some(RemoteLens {
             host: "fm@motum".into(),
+            env: Default::default(),
             workspace: ws("motum"),
             remote_workspace: Some(ws("r-default")),
         });
@@ -31554,6 +31602,7 @@ mod remote_lens_tests {
             app.pending_link,
             Some(LinkTarget::Local {
                 workspace: ws("default"),
+                origin: ws("motum"),
             })
         );
         assert!(!out
@@ -31597,7 +31646,10 @@ mod remote_lens_tests {
     #[tokio::test]
     async fn link_answers_are_adopted_only_for_the_latest_attempt() {
         let mut app = local_app();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        app.pending_link = None;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let (_etx, erx) = tokio::sync::mpsc::channel(1);
         let mut channels = ipc::IpcChannels {
             tx,
@@ -31613,6 +31665,7 @@ mod remote_lens_tests {
                 generation: 1,
                 target: LinkTarget::Local {
                     workspace: ws("default"),
+                    origin: ws("motum"),
                 },
                 result: Err("late".into()),
             },
@@ -31632,6 +31685,7 @@ mod remote_lens_tests {
                     host: "fm@motum".into(),
                     env: Default::default(),
                     workspace: ws("motum"),
+                    origin: ws("default"),
                 },
                 result: Err("fm@motum: Permission denied".into()),
             },
@@ -31640,7 +31694,115 @@ mod remote_lens_tests {
         assert_eq!(app.conn, ConnState::Connected);
         assert_eq!(app.flash.as_deref(), Some("fm@motum: Permission denied"));
         assert!(app.remote.is_none());
+        assert_eq!(app.tree.active_workspace, ws("default"));
         assert_eq!(app.tree.projects.len(), 2, "the local tree is untouched");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientRequest::OpenWorkspace { id, .. }) if id == ws("default")
+        ));
+    }
+
+    #[tokio::test]
+    async fn returning_local_invalidates_an_inflight_remote_link() {
+        let mut app = local_app();
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        app.pending_link = None;
+        app.link_generation = 1;
+        app.conn = ConnState::Connecting;
+
+        out.clear();
+        assert!(switch_workspace(&mut app, ws("default"), &mut out));
+        assert_eq!(app.link_generation, 2);
+        assert_eq!(app.conn, ConnState::Connected);
+        assert!(out.iter().any(
+            |request| matches!(request, ClientRequest::OpenWorkspace { id, .. } if *id == ws("default"))
+        ));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let mut channels = ipc::IpcChannels {
+            tx,
+            rx: erx,
+            link: None,
+        };
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        let (_new_etx, new_erx) = tokio::sync::mpsc::channel(1);
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 1,
+                target: LinkTarget::Remote {
+                    host: "fm@motum".into(),
+                    env: Default::default(),
+                    workspace: ws("motum"),
+                    origin: ws("default"),
+                },
+                result: Ok(ipc::IpcChannels {
+                    tx: new_tx,
+                    rx: new_erx,
+                    link: None,
+                }),
+            },
+        )
+        .await;
+        assert!(app.remote.is_none());
+        assert_eq!(app.tree.active_workspace, ws("default"));
+    }
+
+    #[test]
+    fn reselecting_a_disconnected_bound_tab_reconnects() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        app.conn = ConnState::Disconnected;
+
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Remote {
+                host: "fm@motum".into(),
+                env: Default::default(),
+                workspace: ws("motum"),
+                origin: ws("motum"),
+            })
+        );
+    }
+
+    #[test]
+    fn the_remote_environment_is_part_of_the_endpoint() {
+        let mut app = local_app();
+        let old_env = std::collections::BTreeMap::from([("NEBULA_DATA_DIR".into(), "/old".into())]);
+        let new_env = std::collections::BTreeMap::from([("NEBULA_DATA_DIR".into(), "/new".into())]);
+        app.workspace_hosts.insert(
+            "motum".into(),
+            crate::workspace_hosts::Binding::new("fm@motum".into(), new_env.clone()),
+        );
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: old_env,
+            workspace: ws("default"),
+            remote_workspace: Some(ws("r-default")),
+        });
+
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Remote {
+                host: "fm@motum".into(),
+                env: new_env,
+                workspace: ws("motum"),
+                origin: ws("default"),
+            })
+        );
     }
 
     /// While a remote is showing, the features that read this machine's
@@ -31650,6 +31812,7 @@ mod remote_lens_tests {
         let mut app = local_app();
         app.remote = Some(RemoteLens {
             host: "fm@motum".into(),
+            env: Default::default(),
             workspace: ws("motum"),
             remote_workspace: Some(ws("r-default")),
         });
@@ -31680,6 +31843,7 @@ mod remote_lens_tests {
                     host: "fm@box".into(),
                     env: Default::default(),
                     workspace: ws("default"),
+                    origin: ws("default"),
                 })
             );
             // One word only: a path after the host would become a command.
@@ -31690,6 +31854,7 @@ mod remote_lens_tests {
             // Empty unbinds; showing a remote, that means coming home.
             app.remote = Some(RemoteLens {
                 host: "fm@box".into(),
+                env: Default::default(),
                 workspace: ws("default"),
                 remote_workspace: None,
             });
@@ -31699,6 +31864,7 @@ mod remote_lens_tests {
                 app.pending_link,
                 Some(LinkTarget::Local {
                     workspace: ws("default"),
+                    origin: ws("default"),
                 })
             );
         });
