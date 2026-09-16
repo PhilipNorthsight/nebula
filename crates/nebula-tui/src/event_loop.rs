@@ -471,7 +471,7 @@ async fn main_loop(
             _ = tokio::time::sleep(app.issues_prefetch_delay().unwrap_or_default()),
                 if app.pending_issues_prefetch.is_some() =>
             {
-                crate::issues::fire_prefetch(&mut app);
+                fire_issues_prefetch(&mut app);
             }
             // Standing keep-warm: periodically re-assert the selected
             // worktree's warm default-spec Claude session so the daemon's
@@ -569,7 +569,7 @@ async fn main_loop(
             // an issue long enough to fetch its comments.
             _ = tokio::time::sleep(app.issue_detail_delay().unwrap_or(Duration::MAX)),
                 if app.issue_detail_delay().is_some() => {
-                crate::issues::lookup_detail(&mut app);
+                lookup_issue_detail(&mut app);
             }
             answer = issues_rx.recv() => {
                 if let Some(answer) = answer {
@@ -770,7 +770,11 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
                     vec![ClientRequest::OpenWorkspace { req_id, id: origin }]
                 }
             };
-            restore_context(app, &mut out);
+            if app.remote.is_some() {
+                restore_selected_context(app, &mut out);
+            } else {
+                restore_context(app, &mut out);
+            }
             sync_pty_size(app, &mut out);
             clamp_selections(app);
             refresh_palette(app);
@@ -796,6 +800,22 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     app.pending_prewarm = None;
     app.git_changes = None;
     app.git_changes_inflight = None;
+    if matches!(&target, LinkTarget::Remote { .. })
+        && matches!(
+            &app.overlay,
+            Some(
+                Overlay::Diff(_)
+                    | Overlay::Files(_)
+                    | Overlay::Grep(_)
+                    | Overlay::Tree(_)
+                    | Overlay::FileTabs(_)
+                    | Overlay::Issues(_)
+                    | Overlay::BranchSwitch(_)
+            )
+        )
+    {
+        app.overlay = None;
+    }
     match &target {
         LinkTarget::Remote {
             host,
@@ -847,7 +867,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
 /// Ask the loop to point the connection at `workspace`'s machine — its
 /// bound host, or this one — when that is not where it already points.
 /// True when routing was handled without an immediate OpenWorkspace.
-fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
+fn request_link_for(app: &mut App, workspace: &WorkspaceId, out: &mut Vec<ClientRequest>) -> bool {
     let binding = app.workspace_hosts.get(workspace.as_str()).cloned();
     let origin = app
         .live_workspace
@@ -871,19 +891,26 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
             });
             true
         }
-        // Another tab bound to the machine already connected: the same
-        // tree, refiled under the new tab.
         (Some(_), Some(mut lens)) => {
             if app.pending_link.take().is_some() || app.conn == ConnState::Connecting {
                 app.link_generation += 1;
                 app.conn = ConnState::Connected;
             }
+            let switched_tab = lens.workspace != *workspace;
             lens.workspace = workspace.clone();
-            for p in &mut app.tree.projects {
-                p.workspace_id = workspace.clone();
+            if switched_tab {
+                lens.remote_workspace = None;
             }
             app.remote = Some(lens);
             app.live_workspace = Some(workspace.clone());
+            if switched_tab {
+                app.tree.projects.clear();
+                app.tree.worktrees.clear();
+                app.tree.agents.clear();
+                app.tree.terminals.clear();
+                app.tree.links.clear();
+                out.push(ClientRequest::Subscribe);
+            }
             true
         }
         // Covered by the first arm's guard (no remote connected means the
@@ -1089,7 +1116,31 @@ fn land_git_changes(app: &mut App, worktree: WorktreeId, count: Option<usize>) {
 }
 
 fn local_lookup_landing_blocked(app: &App) -> bool {
-    app.remote.is_some() || app.conn == ConnState::Connecting || app.pending_link.is_some()
+    app.remote.is_some()
+}
+
+fn schedule_issues_prefetch(app: &mut App) {
+    if app.remote.is_some() {
+        app.pending_issues_prefetch = None;
+        return;
+    }
+    crate::issues::schedule_prefetch(app);
+}
+
+fn fire_issues_prefetch(app: &mut App) {
+    if app.remote.is_some() {
+        app.pending_issues_prefetch = None;
+        return;
+    }
+    crate::issues::fire_prefetch(app);
+}
+
+fn lookup_issue_detail(app: &mut App) {
+    if app.remote.is_some() {
+        app.pending_issue_detail = None;
+        return;
+    }
+    crate::issues::lookup_detail(app);
 }
 
 fn land_issues_answer(app: &mut App, answer: crate::issues::IssuesAnswer) {
@@ -1604,6 +1655,10 @@ fn prune_pull_requests_to_tree(app: &mut App) {
 /// one exception: the pane shows it at once, and the rest that would have
 /// fetched a missing body fetches a fresh copy over it.
 fn schedule_pr_detail(app: &mut App) {
+    if app.remote.is_some() {
+        app.pending_pr_detail = None;
+        return;
+    }
     let pending = app.previewed_pr().and_then(|pr| {
         let url = pr.url;
         let fresh = app.pr_detail.contains_key(&url) && !app.pr_detail_stale.contains(&url);
@@ -1647,6 +1702,9 @@ fn lookup_pr_detail(
     let Some((pending, _)) = app.pending_pr_detail.take() else {
         return;
     };
+    if app.remote.is_some() {
+        return;
+    }
     if !pending.dir.is_dir() {
         app.pr_detail_failed.insert(pending.url);
         app.dirty = true;
@@ -4599,15 +4657,19 @@ fn switch_workspace_inner(
 ) -> bool {
     if app.tree.active_workspace == id {
         if !workspace_endpoint_is_live(app, &id) {
-            return request_link_for(app, &id);
+            return request_link_for(app, &id, out);
         }
         return false;
     }
     remember_context(app);
     app.tree.active_workspace = id.clone();
     app.sel_project = 0;
-    let routed = request_link_for(app, &id);
-    let changing_endpoint = app.pending_link.is_some();
+    let routed = request_link_for(app, &id, out);
+    let changing_endpoint = app.pending_link.is_some()
+        || app
+            .remote
+            .as_ref()
+            .is_some_and(|lens| lens.remote_workspace.is_none());
     if restore {
         // Land on the project this workspace was left on before restoring
         // the worktree and session, which are remembered per project and
@@ -4742,7 +4804,7 @@ fn workspace_menu(app: &App) -> Vec<MenuItem> {
 /// it is the open tab, connect where it now points. The binding is written
 /// before anything connects, so a host that fails to answer is still
 /// bound — `h` again to fix the address, or empty to make the tab local.
-fn bind_workspace_host(app: &mut App, id: WorkspaceId, value: &str) {
+fn bind_workspace_host(app: &mut App, id: WorkspaceId, value: &str, out: &mut Vec<ClientRequest>) {
     let host = match crate::workspace_hosts::parse_host(value) {
         Ok(host) => host,
         Err(err) => {
@@ -4779,7 +4841,7 @@ fn bind_workspace_host(app: &mut App, id: WorkspaceId, value: &str) {
     // already connected: nothing to reconnect, and the daemon's scope is
     // unchanged either way.
     if app.tree.active_workspace == id {
-        request_link_for(app, &id);
+        request_link_for(app, &id, out);
     }
 }
 
@@ -6419,7 +6481,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
-        PromptKind::WorkspaceHost { id } => bind_workspace_host(app, id, &value),
+        PromptKind::WorkspaceHost { id } => bind_workspace_host(app, id, &value, out),
         PromptKind::SettingText { kind } => {
             // Same path as a toggled row (`apply_setting_at`): write the
             // file, adopt it live, and land back on the overlay — with the
@@ -6913,10 +6975,14 @@ fn restore_workspace_project(app: &mut App) {
 /// After a project switch: land on the project's remembered worktree (its
 /// main checkout otherwise), then re-show that worktree's session.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    app.sel_worktree = 0;
     schedule_open_prs_lookup(app);
-    crate::issues::schedule_prefetch(app);
+    schedule_issues_prefetch(app);
     schedule_pr_detail(app);
+    restore_selected_context(app, out);
+}
+
+fn restore_selected_context(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.sel_worktree = 0;
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
             if let Some(i) = app.worktree_row_of(&wid) {
@@ -9357,7 +9423,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // restart.
             let active = app.tree.active_workspace.clone();
             if app.workspace_hosts.contains_key(active.as_str()) {
-                request_link_for(app, &active);
+                request_link_for(app, &active, out);
             }
             let session_restored = ui_state
                 .as_deref()
@@ -9374,7 +9440,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             schedule_prewarm(app);
             // And ask for the restored project's open issues, so an `i`
             // straight after launch has rows to paint.
-            crate::issues::schedule_prefetch(app);
+            schedule_issues_prefetch(app);
             // The cursor came back on the session the user left on; bring
             // its terminal back with it, exactly as landing on the row would.
             // No debounce: a boot restores one remembered session once, so
@@ -32124,7 +32190,6 @@ mod remote_lens_tests {
             remote_workspace: Some(ws("r-default")),
         });
         app.live_workspace = Some(ws("motum"));
-        app.conn = ConnState::Connected;
         let mut out = Vec::new();
         assert!(switch_workspace(&mut app, ws("default"), &mut out));
         let target = app.pending_link.take().unwrap();
@@ -32247,6 +32312,91 @@ mod remote_lens_tests {
                 origin: ws("default"),
             })
         );
+    }
+
+    #[test]
+    fn same_endpoint_tabs_refresh_the_remote_workspace() {
+        let mut app = local_app();
+        app.tree.workspaces.push(Workspace {
+            id: ws("other"),
+            name: "Other".into(),
+        });
+        app.workspace_hosts.insert(
+            "other".into(),
+            crate::workspace_hosts::Binding::Host("fm@motum".into()),
+        );
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        app.live_workspace = Some(ws("motum"));
+        app.conn = ConnState::Connected;
+        let mut out = Vec::new();
+
+        assert!(switch_workspace(&mut app, ws("other"), &mut out));
+
+        let lens = app.remote.as_ref().unwrap();
+        assert_eq!(lens.workspace, ws("other"));
+        assert_eq!(lens.remote_workspace, None);
+        assert!(app.tree.projects.is_empty());
+        assert!(app.tree.worktrees.is_empty());
+        assert!(app.tree.agents.is_empty());
+        assert!(app.tree.terminals.is_empty());
+        assert!(app.tree.links.is_empty());
+        assert!(matches!(out.as_slice(), [ClientRequest::Subscribe]));
+    }
+
+    #[test]
+    fn a_pr_comment_failure_lands_during_a_local_transition() {
+        let mut app = local_app();
+        let url = "https://github.com/o/r/pull/7".to_string();
+        app.conn = ConnState::Connecting;
+        app.pr_comment_inflight.insert(url.clone());
+
+        land_pr_comment(
+            &mut app,
+            PrCommentAnswer {
+                number: 7,
+                url,
+                label: "#7 Attach links".into(),
+                body: "Please retry".into(),
+                result: Err("not logged in".into()),
+            },
+        );
+
+        assert!(app.pr_comment_inflight.is_empty());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("couldn't post the comment on #7: not logged in")
+        );
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Prompt(prompt)) if prompt.input.as_str() == "Please retry"
+        ));
+    }
+
+    #[test]
+    fn an_issues_debounce_does_not_start_under_the_lens() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        let project = ProjectId("local".into());
+        app.pending_issues_prefetch = Some((project, std::time::Instant::now()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.issues_tx = Some(tx);
+
+        fire_issues_prefetch(&mut app);
+
+        assert!(app.pending_issues_prefetch.is_none());
+        assert!(app.issues_inflight.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -32611,8 +32761,9 @@ mod remote_lens_tests {
         let dir = tempfile::tempdir().unwrap();
         crate::workspace_hosts::with_store_path(dir.path().join("workspace_hosts.json"), || {
             let mut app = local_app();
+            let mut out = Vec::new();
             app.workspace_hosts.clear();
-            bind_workspace_host(&mut app, ws("default"), "fm@box");
+            bind_workspace_host(&mut app, ws("default"), "fm@box", &mut out);
             assert_eq!(app.workspace_hosts.get("default").unwrap().host(), "fm@box");
             assert_eq!(
                 app.pending_link,
@@ -32625,7 +32776,7 @@ mod remote_lens_tests {
             );
             // One word only: a path after the host would become a command.
             app.pending_link = None;
-            bind_workspace_host(&mut app, ws("default"), "fm@box /srv");
+            bind_workspace_host(&mut app, ws("default"), "fm@box /srv", &mut out);
             assert!(app.pending_link.is_none());
             assert!(app.flash.as_deref().unwrap().contains("one word"));
             // Empty unbinds; showing a remote, that means coming home.
@@ -32635,7 +32786,7 @@ mod remote_lens_tests {
                 workspace: ws("default"),
                 remote_workspace: None,
             });
-            bind_workspace_host(&mut app, ws("default"), "");
+            bind_workspace_host(&mut app, ws("default"), "", &mut out);
             assert!(!app.workspace_hosts.contains_key("default"));
             assert_eq!(
                 app.pending_link,
