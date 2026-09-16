@@ -256,6 +256,10 @@ async fn main_loop(
     app.conn = ConnState::Connected;
     app.startup_workspace = startup_workspace;
     app.workspace_hosts = crate::workspace_hosts::load();
+    // Every bound machine gets its ssh master opened now, in the
+    // background, so the first switch to its tab is as quick as the rest.
+    app.warm_ssh = true;
+    warm_bound_hosts(&app);
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
     app.keymap = cfg.keymap();
@@ -1059,9 +1063,36 @@ fn ingest_remote_snapshot(app: &mut App, tree: RemoteTree, out: &mut Vec<ClientR
     app.tree.agents = agents;
     app.tree.terminals = terminals;
     app.tree.links = links;
+    // Land where the tab was left — its project, that project's worktree,
+    // that worktree's session, remembered by the remote's own ids when the
+    // user switched away — and bring the session back into the pane, as
+    // a local switch does. A first visit lands on the first row and its
+    // most recent session, so the tab never comes up blank. Only the
+    // selection restore: the lookups `restore_context` would schedule
+    // read local checkouts, and these rows have none.
     app.sel_project = 0;
-    app.sel_worktree = 0;
-    app.sel_session = 0;
+    restore_workspace_project(app);
+    restore_selected_context(app, out);
+}
+
+/// The distinct machines the bound tabs name, each given an ssh master
+/// ahead of time (see `ipc::warm_ssh`). Nothing outside the real loop
+/// spawns one: a test app leaves `warm_ssh` off.
+fn warm_bound_hosts(app: &App) {
+    if !app.warm_ssh {
+        return;
+    }
+    for host in hosts_to_warm(&app.workspace_hosts) {
+        ipc::warm_ssh(&host);
+    }
+}
+
+/// One entry per machine, however many tabs point at it.
+fn hosts_to_warm(bindings: &crate::workspace_hosts::Bindings) -> Vec<String> {
+    let mut hosts: Vec<String> = bindings.values().map(|b| b.host().to_string()).collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Flash and refuse a workspace create / rename / delete while a REMOTE
@@ -4605,6 +4636,10 @@ pub(crate) fn menu_quick_return(menu: &ContextMenu) -> Option<crate::quick_promp
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
 fn open_workspace_picker(app: &mut App) {
+    // The switcher is where a remote tab gets picked: make sure its
+    // machine's master is up before the pick, in case the last one aged
+    // out. A touch through a live master costs nothing visible.
+    warm_bound_hosts(app);
     let active = &app.tree.active_workspace;
     let items: Vec<MenuItem> = app
         .tree
@@ -31849,6 +31884,187 @@ mod remote_lens_tests {
         assert!(out
             .iter()
             .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == ws("r-motum"))));
+    }
+
+    fn remote_worktree(id: &str, project: &str) -> nebula_core::Worktree {
+        nebula_core::Worktree {
+            id: nebula_core::WorktreeId(id.into()),
+            project_id: ProjectId(project.into()),
+            path: format!("/srv/{project}").into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        }
+    }
+
+    fn remote_agent(id: &str, worktree: &str, sort_order: i64) -> nebula_core::Agent {
+        nebula_core::Agent {
+            id: AgentId(id.into()),
+            worktree_id: nebula_core::WorktreeId(worktree.into()),
+            name: id.into(),
+            status: nebula_core::AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order,
+            status_changed_at: 0,
+            alive: true,
+            recent_prompts: Vec::new(),
+        }
+    }
+
+    /// Back on a bound tab, the lens lands where the tab was left — the
+    /// remembered project, that project's worktree, that worktree's
+    /// session, all by the remote's own ids — and the session comes back
+    /// into the pane, exactly as a local switch brings its session back.
+    /// No click needed to see the agent that was running there.
+    #[test]
+    fn the_lens_lands_on_the_remembered_session_and_attaches_it() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: None,
+        });
+        // What `remember_context` wrote when the user switched away.
+        app.last_project_for_workspace
+            .insert(ws("motum"), ProjectId("motum-etl".into()));
+        app.last_worktree_for_project.insert(
+            ProjectId("motum-etl".into()),
+            nebula_core::WorktreeId("w-etl".into()),
+        );
+        let a_etl = SessionRef::Agent(AgentId("a-etl".into()));
+        app.last_session_for_worktree
+            .insert(nebula_core::WorktreeId("w-etl".into()), a_etl.clone());
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Snapshot {
+                workspaces: vec![Workspace {
+                    id: ws("r-motum"),
+                    name: "Motum".into(),
+                }],
+                active_workspace: ws("r-motum"),
+                projects: vec![
+                    project("motum-reports", "r-motum"),
+                    project("motum-etl", "r-motum"),
+                ],
+                worktrees: vec![
+                    remote_worktree("w-reports", "motum-reports"),
+                    remote_worktree("w-etl", "motum-etl"),
+                ],
+                agents: vec![
+                    remote_agent("a-reports", "w-reports", 0),
+                    remote_agent("a-etl-other", "w-etl", 0),
+                    remote_agent("a-etl", "w-etl", 1),
+                ],
+                terminals: Vec::new(),
+                links: Vec::new(),
+                pr_seen: Vec::new(),
+                ui_state: None,
+            },
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("motum-etl".into()),
+            "the project the tab was left on, not row 0"
+        );
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.clone()),
+            Some(nebula_core::WorktreeId("w-etl".into()))
+        );
+        assert_eq!(
+            app.selected_session_row().and_then(|r| r.sref()),
+            Some(a_etl.clone()),
+            "and that worktree's remembered session"
+        );
+        let attaching = out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a_etl))
+            || app
+                .pending_attach
+                .as_ref()
+                .is_some_and(|(sref, _)| *sref == a_etl);
+        assert!(
+            attaching,
+            "the session comes back into the pane, got {out:?}"
+        );
+    }
+
+    /// A first visit has nothing remembered: the tab lands on its first
+    /// project and that checkout's session, never on a blank pane.
+    #[test]
+    fn a_first_visit_to_the_lens_shows_the_first_session() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: None,
+        });
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Snapshot {
+                workspaces: vec![Workspace {
+                    id: ws("r-motum"),
+                    name: "Motum".into(),
+                }],
+                active_workspace: ws("r-motum"),
+                projects: vec![project("motum-reports", "r-motum")],
+                worktrees: vec![remote_worktree("w-reports", "motum-reports")],
+                agents: vec![remote_agent("a-reports", "w-reports", 0)],
+                terminals: Vec::new(),
+                links: Vec::new(),
+                pr_seen: Vec::new(),
+                ui_state: None,
+            },
+            &mut out,
+        );
+        let a_reports = SessionRef::Agent(AgentId("a-reports".into()));
+        assert_eq!(
+            app.selected_session_row().and_then(|r| r.sref()),
+            Some(a_reports.clone())
+        );
+        let attaching = out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == a_reports))
+            || app
+                .pending_attach
+                .as_ref()
+                .is_some_and(|(sref, _)| *sref == a_reports);
+        assert!(attaching, "got {out:?}");
+    }
+
+    /// Every bound machine gets one ssh master warmed, however many tabs
+    /// point at it; a test app (`warm_ssh` off) never spawns one.
+    #[test]
+    fn hosts_to_warm_names_each_machine_once() {
+        use crate::workspace_hosts::Binding;
+        let mut bindings = crate::workspace_hosts::Bindings::new();
+        bindings.insert("a".into(), Binding::Host("fm@motum".into()));
+        bindings.insert(
+            "b".into(),
+            Binding::new(
+                "fm@motum".into(),
+                [("X".to_string(), "1".to_string())].into(),
+            ),
+        );
+        bindings.insert("c".into(), Binding::Host("other".into()));
+        assert_eq!(hosts_to_warm(&bindings), ["fm@motum", "other"]);
+        assert!(hosts_to_warm(&Default::default()).is_empty());
+        let app = local_app();
+        assert!(!app.warm_ssh);
     }
 
     /// The remote's Snapshot keeps this machine's tabs, takes only the

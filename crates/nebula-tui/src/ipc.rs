@@ -285,7 +285,8 @@ pub async fn connect_remote(
 ) -> Result<IpcChannels> {
     let cmd = relay_command(&nebula_core::remote_script::install_url(), env);
     let mut child = tokio::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-T", "--", host, &cmd])
+        .args(ssh_options())
+        .args(["-T", "--", host, &cmd])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -357,6 +358,74 @@ pub async fn connect_remote(
 
 /// Long enough for a first connection to install nebula on a bare box.
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a shared ssh master outlives its last link, in the background.
+/// Long enough that a return to a tab after a coffee break still lands in
+/// tens of milliseconds; short enough that a laptop closed for the evening
+/// holds no idle session overnight.
+const SSH_MASTER_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// The options every ssh this module runs shares. `BatchMode`, so nothing
+/// prompts on the TUI's terminal. Then multiplexing: the first link to a
+/// host becomes a master that stays in the background for
+/// [`SSH_MASTER_IDLE`] after its last use, and every later link to that
+/// host — the next switch to its tab — rides the authenticated connection
+/// instead of paying the handshake again: tens of milliseconds instead of
+/// most of a second. The control socket lives in the runtime dir (mode
+/// 0700, the same boundary as the daemon socket); `%C` is ssh's hash of
+/// host, user and port, so two bindings to one machine share a master.
+/// `~/.ssh/config` is neither read for this nor written: the options ride
+/// on the command line, and a `ControlPath` of the user's own there keeps
+/// applying to their other sessions.
+pub(crate) fn ssh_options() -> Vec<String> {
+    ssh_options_under(&nebula_core::paths::runtime_dir())
+}
+
+fn ssh_options_under(runtime_dir: &std::path::Path) -> Vec<String> {
+    let mut options = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+    // A unix socket path holds about a hundred bytes, and `%C` expands to
+    // forty. A runtime dir too deep for that — or not there yet, which
+    // only a link before the local daemon ever ran could see — gets no
+    // multiplexing rather than an ssh that fails to bind.
+    let control = runtime_dir.join("ssh-%C");
+    let fits = control.as_os_str().len() - 2 + 40 <= 100;
+    if fits && runtime_dir.is_dir() {
+        options.extend([
+            "-o".to_string(),
+            "ControlMaster=auto".to_string(),
+            "-o".to_string(),
+            format!("ControlPath={}", control.display()),
+            "-o".to_string(),
+            format!("ControlPersist={}", SSH_MASTER_IDLE.as_secs()),
+        ]);
+    }
+    options
+}
+
+/// Open — or touch — the shared master for `host` in the background, so
+/// the first switch to its tab finds an authenticated connection waiting.
+/// The TUI does it at start for every bound host, and again when the
+/// switcher opens, in case the master timed out meanwhile. `true` is the
+/// whole remote command; the master outlives it by [`SSH_MASTER_IDLE`].
+/// Silent on every failure — the link itself reports those, with ssh's
+/// words, when the user actually goes there.
+pub(crate) fn warm_ssh(host: &str) {
+    let spawned = tokio::process::Command::new("ssh")
+        .args(ssh_options())
+        .args(["-T", "--", host, "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+        Err(err) => tracing::debug!(host, %err, "ssh warm-up did not start"),
+    }
+}
 
 /// The tail of a stderr transcript, joined on one line for a flash.
 fn last_lines(text: &str, n: usize) -> String {
@@ -1121,6 +1190,31 @@ mod tests {
             cmd.ends_with("nebula-relay 'https://example.com/it'\\''s.sh'"),
             "{cmd}"
         );
+    }
+
+    /// The link multiplexes through a control socket in the runtime dir,
+    /// so the second switch to a tab skips the handshake — unless the dir
+    /// is too deep for a socket path or is not there, when plain ssh is
+    /// the safe fallback.
+    #[test]
+    fn ssh_options_multiplex_under_a_runtime_dir_that_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = ssh_options_under(dir.path());
+        assert_eq!(&options[..2], ["-o", "BatchMode=yes"]);
+        let joined = options.join(" ");
+        assert!(joined.contains("-o ControlMaster=auto"), "{joined}");
+        assert!(
+            joined.contains(&format!("-o ControlPath={}/ssh-%C", dir.path().display())),
+            "{joined}"
+        );
+        assert!(joined.contains("-o ControlPersist=1800"), "{joined}");
+
+        let missing = dir.path().join("not-yet");
+        assert_eq!(ssh_options_under(&missing), ["-o", "BatchMode=yes"]);
+
+        let deep = dir.path().join("x".repeat(120));
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(ssh_options_under(&deep), ["-o", "BatchMode=yes"]);
     }
 
     /// Which side is stale decides the advice, and it is about the remote
