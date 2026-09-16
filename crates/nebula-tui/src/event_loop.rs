@@ -1763,6 +1763,9 @@ fn land_pr_comment(app: &mut App, answer: PrCommentAnswer) {
 /// replaces the modal's contents in place when it differs, and only goes to
 /// the cache if the modal has since been closed (`land_pr_diff`).
 fn request_pr_diff(app: &mut App) {
+    if remote_blocks(app, "viewing a pull-request diff") {
+        return;
+    }
     let Some(pr) = app.previewed_pr() else {
         return;
     };
@@ -3390,6 +3393,9 @@ fn open_selected_worktree(app: &mut App) {
 /// runs it, not the DAEMON: it opens a browser or an editor on the machine
 /// the user is sitting at.
 fn open_worktree(app: &mut App, worktree: &nebula_core::Worktree) {
+    if remote_blocks(app, "opening a checkout") {
+        return;
+    }
     let main = app
         .tree
         .projects
@@ -9616,11 +9622,24 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         ServerEvent::EntityRemoved { id } => {
             let before = selection_snapshot(app);
+            if let nebula_core::EntityId::Workspace(ws) = &id {
+                if app
+                    .remote
+                    .as_ref()
+                    .and_then(|lens| lens.remote_workspace.as_ref())
+                    == Some(ws)
+                {
+                    if let Some(lens) = &mut app.remote {
+                        lens.remote_workspace = None;
+                    }
+                    out.push(ClientRequest::Subscribe);
+                }
+            }
             // Where a deleted workspace sat in the WORKSPACES BAR: the
             // reseat below lands on its neighbor, and the row is gone
             // once `apply_removal` runs.
             let removed_tab = match &id {
-                nebula_core::EntityId::Workspace(ws) => {
+                nebula_core::EntityId::Workspace(ws) if app.remote.is_none() => {
                     app.tree.workspaces.iter().position(|w| &w.id == ws)
                 }
                 _ => None,
@@ -31527,7 +31546,7 @@ diff --git a/src/c.rs b/src/c.rs
 /// the routing that decides when a workspace switch changes machines.
 #[cfg(test)]
 mod remote_lens_tests {
-    use super::tests::{hse, seed_tree};
+    use super::tests::{hse, seed_open_prs, seed_tree};
     use super::*;
     use crate::app::RemoteLens;
     use nebula_core::{Entity, Project, ProjectId, ServerEvent, Workspace, WorkspaceId};
@@ -31735,6 +31754,67 @@ mod remote_lens_tests {
             2,
             "nor do their removals reach it"
         );
+    }
+
+    #[test]
+    fn removing_the_selected_remote_workspace_refreshes_only_the_lens() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        let local_tabs: Vec<_> = app
+            .tree
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
+            .collect();
+        let mut out = Vec::new();
+
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: nebula_core::EntityId::Workspace(ws("r-default")),
+            },
+            &mut out,
+        );
+
+        assert_eq!(app.remote.as_ref().unwrap().remote_workspace, None);
+        assert_eq!(
+            app.tree
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
+                .collect::<Vec<_>>(),
+            local_tabs
+        );
+        assert!(matches!(out.as_slice(), [ClientRequest::Subscribe]));
+
+        app.remote.as_mut().unwrap().remote_workspace = Some(ws("r-next"));
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: nebula_core::EntityId::Workspace(ws("r-other")),
+            },
+            &mut out,
+        );
+
+        assert_eq!(
+            app.remote.as_ref().unwrap().remote_workspace,
+            Some(ws("r-next"))
+        );
+        assert_eq!(
+            app.tree
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
+                .collect::<Vec<_>>(),
+            local_tabs
+        );
+        assert!(out.is_empty());
     }
 
     /// Switching onto a bound tab queues the link instead of scoping the
@@ -32328,6 +32408,40 @@ mod remote_lens_tests {
         // The bindings prompt itself is fine from anywhere.
         open_prompt(&mut app, PromptKind::WorkspaceHost { id: ws("motum") });
         assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "fm@motum"));
+    }
+
+    #[test]
+    fn menu_disk_actions_are_refused_under_the_lens() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_open_prs(&mut app, &[(7, "Attach links")]);
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("default"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        app.sel_worktree = 1;
+        let (pr_diff_tx, mut pr_diff_rx) = tokio::sync::mpsc::unbounded_channel();
+        app.pr_diff_tx = Some(pr_diff_tx);
+        let mut out = Vec::new();
+
+        run_menu_action(&mut app, MenuAction::ViewPrDiff, &mut out);
+
+        assert!(out.is_empty());
+        assert!(app.pr_diff_inflight.is_none());
+        assert!(pr_diff_rx.try_recv().is_err());
+        assert!(app.flash.as_deref().unwrap().contains("fm@motum"));
+
+        app.flash = None;
+        run_menu_action(
+            &mut app,
+            MenuAction::OpenWorktree(WorktreeId("w1".into())),
+            &mut out,
+        );
+
+        assert!(out.is_empty());
+        assert!(app.flash.as_deref().unwrap().contains("fm@motum"));
     }
 
     #[test]
