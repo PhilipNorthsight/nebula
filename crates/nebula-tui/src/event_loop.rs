@@ -951,7 +951,9 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
             true
         }
         (None, None) => {
-            if app.conn == ConnState::Connecting && app.live_workspace.is_none() {
+            if app.conn == ConnState::Disconnected
+                || (app.conn == ConnState::Connecting && app.live_workspace.is_none())
+            {
                 app.pending_link = Some(LinkTarget::Local {
                     workspace: workspace.clone(),
                     origin,
@@ -32048,6 +32050,8 @@ mod remote_lens_tests {
         app.pending_link = None;
         app.remote = None;
         app.workspace_hosts.clear();
+        app.conn = ConnState::Connected;
+        app.live_workspace = Some(ws("default"));
         out.clear();
         app.tree.active_workspace = ws("default");
         assert!(switch_workspace(&mut app, ws("motum"), &mut out));
@@ -32055,6 +32059,32 @@ mod remote_lens_tests {
         assert!(out
             .iter()
             .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == ws("motum"))));
+    }
+
+    #[test]
+    fn switching_unbound_tabs_reconnects_a_disconnected_local_daemon() {
+        let mut app = local_app();
+        app.tree.workspaces.push(Workspace {
+            id: ws("other"),
+            name: "Other".into(),
+        });
+        app.conn = ConnState::Disconnected;
+        app.remote = None;
+        app.live_workspace = Some(ws("default"));
+        let mut out = Vec::new();
+
+        assert!(switch_workspace(&mut app, ws("other"), &mut out));
+
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Local {
+                workspace: ws("other"),
+                origin: ws("default"),
+            })
+        );
+        assert!(!out
+            .iter()
+            .any(|request| matches!(request, ClientRequest::OpenWorkspace { .. })));
     }
 
     /// Back from a remote, the local Snapshot lands on the tab the user
