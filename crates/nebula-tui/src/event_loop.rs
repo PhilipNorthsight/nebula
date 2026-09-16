@@ -904,6 +904,19 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
     }
 }
 
+fn workspace_endpoint_is_live(app: &App, workspace: &WorkspaceId) -> bool {
+    if app.conn == ConnState::Disconnected {
+        return false;
+    }
+    match app.workspace_hosts.get(workspace.as_str()) {
+        Some(binding) => app
+            .remote
+            .as_ref()
+            .is_some_and(|lens| lens.host == binding.host() && &lens.env == binding.env()),
+        None => app.remote.is_none(),
+    }
+}
+
 /// The entity lists of a remote daemon's Snapshot, as received.
 struct RemoteTree {
     workspaces: Vec<nebula_core::Workspace>,
@@ -2034,8 +2047,25 @@ fn send_with(
     intent: PendingIntent,
     make: impl FnOnce(u64) -> ClientRequest,
 ) {
+    if connecting_blocks(app) {
+        return;
+    }
     let req_id = app.alloc_req_id(intent);
     out.push(make(req_id));
+}
+
+fn connecting_blocks(app: &mut App) -> bool {
+    if app.conn != ConnState::Connecting {
+        return false;
+    }
+    let destination = app
+        .workspace_hosts
+        .get(app.tree.active_workspace.as_str())
+        .map(|binding| binding.host())
+        .unwrap_or("this machine");
+    app.flash = Some(format!("connecting to {destination} — a moment"));
+    app.dirty = true;
+    true
 }
 
 fn log_server_event(ev: &ServerEvent) {
@@ -3766,6 +3796,9 @@ fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
 /// the daemon. Straight from `a` with the confirm off, or from the
 /// dialog's Enter with it on.
 fn archive_agent_now(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     send(app, out, |req_id| ClientRequest::ArchiveAgent {
         req_id,
@@ -4454,7 +4487,7 @@ fn switch_workspace_inner(
     out: &mut Vec<ClientRequest>,
 ) -> bool {
     if app.tree.active_workspace == id {
-        if app.conn == ConnState::Disconnected && app.workspace_hosts.contains_key(id.as_str()) {
+        if !workspace_endpoint_is_live(app, &id) {
             return request_link_for(app, &id);
         }
         return false;
@@ -5944,6 +5977,10 @@ pub(crate) fn submit_prompt_now(app: &mut App, kind: PromptKind, out: &mut Vec<C
 }
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
+    if prompt_sends_daemon_mutation(&prompt.kind) && connecting_blocks(app) {
+        app.overlay = Some(Overlay::Prompt(prompt));
+        return;
+    }
     let value = prompt.input.trim().to_string();
     // An ISSUE SESSION's box may be sent empty: the issue is the task.
     let value = match &prompt.kind {
@@ -6035,15 +6072,19 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     }
     match prompt.kind {
         PromptKind::AddProject => {
-            let expanded = shellexpand_home(&value);
-            if !expanded.exists() {
+            let path = if app.remote.is_some() {
+                std::path::PathBuf::from(&value)
+            } else {
+                shellexpand_home(&value)
+            };
+            if app.remote.is_none() && !path.exists() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                     title: "Create directory".into(),
                     message: format!(
                         "{} doesn't exist, would you like to create it?",
-                        expanded.display()
+                        path.display()
                     ),
-                    action: PendingAction::CreateProjectDir(expanded),
+                    action: PendingAction::CreateProjectDir(path),
                     area: ratatui::layout::Rect::default(),
                 }));
                 return;
@@ -6051,7 +6092,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             send_with(app, out, PendingIntent::SelectCreatedProject, |req_id| {
                 ClientRequest::AddProject {
                     req_id,
-                    path: expanded,
+                    path,
                     name: None,
                     create_missing: false,
                 }
@@ -6300,6 +6341,25 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     }
 }
 
+fn prompt_sends_daemon_mutation(kind: &PromptKind) -> bool {
+    matches!(
+        kind,
+        PromptKind::AddProject
+            | PromptKind::NewWorktree { .. }
+            | PromptKind::NewPrAgent { .. }
+            | PromptKind::ClaudeCloudTask { .. }
+            | PromptKind::AgentPresetTask { .. }
+            | PromptKind::QuickPrompt(_)
+            | PromptKind::CloudMessage { .. }
+            | PromptKind::RenameAgent { .. }
+            | PromptKind::RenameTerminal { .. }
+            | PromptKind::RenameProject { .. }
+            | PromptKind::NewWorkspace
+            | PromptKind::RenameWorkspace { .. }
+            | PromptKind::EditLink { .. }
+    )
+}
+
 fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<ClientRequest>) {
     match action {
         PendingAction::CreateProjectDir(path) => {
@@ -6379,12 +6439,18 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
 
 /// Delete an agent for good, detaching the pane first if it's showing it.
 fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
     send(app, out, |req_id| ClientRequest::DeleteAgent { req_id, id });
 }
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
 fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
     send(app, out, |req_id| ClientRequest::CloseTerminal {
         req_id,
@@ -6397,6 +6463,9 @@ fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
 /// eventual EntityRemoved is a no-op; an Error for this req_id restores the
 /// rows via the rollback stashed in the intent.
 fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     let intent = match remove_worktree_rows(app, &id) {
         Some(rollback) => PendingIntent::DeleteWorktree(rollback),
         None => PendingIntent::None,
@@ -6411,6 +6480,9 @@ fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<ClientRequest>) 
 fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
         MenuAction::Attach(sref) => {
+            if connecting_blocks(app) {
+                return;
+            }
             attach_now(app, sref, out);
             app.focus = Focus::Terminal;
             app.term_locked = true;
@@ -7316,6 +7388,9 @@ fn preview_inner(app: &mut App, delay: Duration, out: &mut Vec<ClientRequest>) {
 /// Enter on the Sessions panel: attach the session under the cursor, or —
 /// on a link row — hand its URL to the browser and stay put.
 fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     let rows = app.visible_session_rows();
     let Some(row) = rows.get(app.sel_session) else {
         return;
@@ -7376,6 +7451,9 @@ fn open_link(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 /// frame instead of waiting for the daemon to say so — and skipped when the
 /// URL isn't a PR, or when the mark wouldn't move.
 fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     let Some(marker) = app
         .pull_requests
         .values()
@@ -7402,6 +7480,9 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 /// instead of waiting for the daemon's upsert — and skipped entirely when
 /// there is nothing to clear.
 fn mark_agent_seen(app: &mut App, id: &AgentId, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     let Some(a) = app.tree.agents.iter_mut().find(|a| &a.id == id && a.unseen) else {
         return;
     };
@@ -7428,6 +7509,9 @@ fn attach_now(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 }
 
 fn attach_inner(app: &mut App, sref: SessionRef, delay: Duration, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     // Whatever lands in the pane has been looked at — walking the cursor
     // onto a row previews it here, so this is where the counts come down.
     // Keyed to the pane swap, not to the Attach: the user is reading the
@@ -7499,6 +7583,9 @@ fn attach_inner(app: &mut App, sref: SessionRef, delay: Duration, out: &mut Vec<
 /// Move the daemon-side attachment to `sref`, releasing whatever it held.
 /// Idempotent, so every caller can just ask for the session it wants.
 fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     if app.attached_sref.as_ref() == Some(&sref) {
         return;
     }
@@ -7535,6 +7622,9 @@ fn send_attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 /// Send the armed attach now — the selection settled, or something needs
 /// the session live this instant (a keystroke about to be forwarded).
 fn fire_pending_attach(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     let Some((sref, _)) = app.pending_attach.take() else {
         return;
     };
@@ -7593,6 +7683,10 @@ fn schedule_prewarm(app: &mut App) {
 /// worktree is a cheap daemon-side no-op, so staleness needs no handling
 /// beyond the daemon skipping rows that no longer exist.
 fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        app.pending_prewarm = None;
+        return;
+    }
     let Some((worktree, _)) = app.pending_prewarm.take() else {
         return;
     };
@@ -7628,6 +7722,9 @@ fn project_of_worktree(app: &App, worktree: &WorktreeId) -> Option<ProjectId> {
 }
 
 fn create_agent(app: &mut App, draft: AgentLaunchDraft, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        return;
+    }
     // A stand-in checkout is not a place the DAEMON knows. A launch that
     // made it (a QUICK PROMPT's, a PR SESSION's) follows on its own Ack;
     // one fired into the NEW WORKTREE modal's row waits on that Ack
@@ -7811,6 +7908,10 @@ fn default_claude_prewarm(worktree: WorktreeId) -> Option<ClientRequest> {
 /// aging one is recycled in place, so without this tick the daemon's reaper
 /// would empty the slot at its max age and the next create would boot cold.
 fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if connecting_blocks(app) {
+        app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+        return;
+    }
     let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
         app.next_keepwarm = None;
         return;
@@ -9586,6 +9687,9 @@ fn attach_created(
     placeholder: Option<AgentId>,
     out: &mut Vec<ClientRequest>,
 ) {
+    if connecting_blocks(app) {
+        return;
+    }
     if let (Some(stand_in), EntityId::Agent(real)) = (&placeholder, &id) {
         placeholder::resolve_agent(app, stand_in, real);
     }
@@ -31917,6 +32021,80 @@ mod remote_lens_tests {
                 origin: ws("default"),
             })
         );
+    }
+
+    #[test]
+    fn daemon_mutations_wait_for_the_link_to_land() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.conn = ConnState::Connecting;
+        let prompt =
+            PromptDialog::new("Add project", "path", "/srv/client", PromptKind::AddProject);
+        let mut out = Vec::new();
+
+        submit_prompt(&mut app, prompt, &mut out);
+
+        assert!(out.is_empty());
+        assert!(matches!(app.overlay, Some(Overlay::Prompt(_))));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("connecting to fm@motum — a moment")
+        );
+    }
+
+    #[test]
+    fn an_active_bound_tab_retries_when_its_endpoint_is_not_live() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.live_workspace = Some(ws("default"));
+        app.conn = ConnState::Connected;
+        let mut out = Vec::new();
+
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Remote {
+                host: "fm@motum".into(),
+                env: Default::default(),
+                workspace: ws("motum"),
+                origin: ws("default"),
+            })
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_remote_project_path_is_sent_without_local_interpretation() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-motum")),
+        });
+        app.live_workspace = Some(ws("motum"));
+        app.conn = ConnState::Connected;
+        let prompt = PromptDialog::new(
+            "Add project",
+            "path",
+            "~/client/repo",
+            PromptKind::AddProject,
+        );
+        let mut out = Vec::new();
+
+        submit_prompt(&mut app, prompt, &mut out);
+
+        assert!(app.overlay.is_none());
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::AddProject {
+                path,
+                create_missing: false,
+                ..
+            }] if path == &std::path::PathBuf::from("~/client/repo")
+        ));
     }
 
     /// While a remote is showing, the features that read this machine's
