@@ -90,8 +90,6 @@ nebula workspace host <name> <user@host> --env NAME=value …  # for a machine w
                                 # ssh command sees none of the login shell's variables.
                                 # Repeatable; without a host, keeps the current one
 nebula workspace host <name> --clear      # make it local again
-nebula relay                    # (internal) what a remote workspace runs on the far end:
-                                # this machine's daemon socket over stdin/stdout
 ```
 
 ## Settings
