@@ -66,6 +66,17 @@ impl TuiHarness {
     /// a stub `gh` on PATH so the pull-request row can be driven without a
     /// GitHub account.
     fn spawn_with_env(extra_env: &[(&str, String)]) -> Self {
+        Self::spawn_with_env_after(extra_env, |_, _| {})
+    }
+
+    /// `spawn_with_env`, with `setup` run against the instance's dirs
+    /// before the TUI starts — for state the TUI reads once at boot, such
+    /// as a workspace binding, made with the one-shot CLI (which brings
+    /// the daemon up itself).
+    fn spawn_with_env_after(
+        extra_env: &[(&str, String)],
+        setup: impl FnOnce(&Path, &Path),
+    ) -> Self {
         // Socket paths must stay under SUN_LEN (~104 bytes) — keep the
         // runtime dir short. Tests share one process, so a per-harness
         // sequence keeps each test on its own daemon.
@@ -77,6 +88,7 @@ impl TuiHarness {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let repos = tempfile::tempdir().unwrap();
+        setup(&runtime_dir, &data_dir);
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -1069,4 +1081,128 @@ fn tui_branch_switcher_moves_the_root_checkout() {
         "{}",
         String::from_utf8_lossy(&stashes.stdout)
     );
+}
+
+/// A second, isolated nebula standing in for another machine.
+struct RemoteInstance {
+    runtime_dir: PathBuf,
+    data_dir: PathBuf,
+}
+
+impl RemoteInstance {
+    fn new() -> Self {
+        let pid = std::process::id();
+        let runtime_dir = PathBuf::from(format!("/tmp/nebrem-rt-{pid}"));
+        let data_dir = PathBuf::from(format!("/tmp/nebrem-data-{pid}"));
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        Self {
+            runtime_dir,
+            data_dir,
+        }
+    }
+
+    fn nebula(&self, args: &[&str]) {
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .env(nebula_core::env::RUNTIME_DIR, &self.runtime_dir)
+            .env(nebula_core::env::DATA_DIR, &self.data_dir)
+            .env(nebula_core::env::AGENT_CMD, "/bin/sh")
+            .env(nebula_core::env::UPDATE_CHECK_SECS, "0")
+            .status()
+            .unwrap();
+        assert!(status.success(), "remote nebula {args:?}");
+    }
+}
+
+impl Drop for RemoteInstance {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .arg("kill")
+            .env(nebula_core::env::RUNTIME_DIR, &self.runtime_dir)
+            .env(nebula_core::env::DATA_DIR, &self.data_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        let _ = std::fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+/// REMOTE WORKSPACES end to end: a workspace bound to a host shows that
+/// host's projects when opened, and the local ones again when left. A stub
+/// `ssh` on PATH stands in for the network — whatever it is asked to run,
+/// it runs `nebula relay` against a second, isolated instance, which is
+/// exactly what the real remote command does on the far end.
+#[test]
+fn tui_remote_workspace_shows_the_other_machines_projects() {
+    let remote = RemoteInstance::new();
+    let remote_repo = tempfile::tempdir().unwrap();
+    let remote_proj = remote_repo.path().join("remote-etl");
+    std::fs::create_dir_all(&remote_proj).unwrap();
+    repo_git(&remote_proj, &["init", "-b", "main"]);
+    remote.nebula(&["add", remote_proj.to_str().unwrap()]);
+
+    let stub_bin = tempfile::tempdir().unwrap();
+    let ssh = stub_bin.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nexec env {}={} {}={} {} relay\n",
+            nebula_core::env::RUNTIME_DIR,
+            remote.runtime_dir.display(),
+            nebula_core::env::DATA_DIR,
+            remote.data_dir.display(),
+            env!("CARGO_BIN_EXE_nebula"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        stub_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // The local instance: one project, and a `client` workspace bound to
+    // the stub's host — made with the one-shot CLI before the TUI starts,
+    // since bindings are read once at boot.
+    let local_repo = tempfile::tempdir().unwrap();
+    let local_proj = local_repo.path().join("local-app");
+    std::fs::create_dir_all(&local_proj).unwrap();
+    repo_git(&local_proj, &["init", "-b", "main"]);
+    let mut tui = TuiHarness::spawn_with_env_after(&[("PATH", path)], |runtime, data| {
+        let local = |args: &[&str]| {
+            let status = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+                .args(args)
+                .env(nebula_core::env::RUNTIME_DIR, runtime)
+                .env(nebula_core::env::DATA_DIR, data)
+                .env(nebula_core::env::AGENT_CMD, "/bin/sh")
+                .env(nebula_core::env::UPDATE_CHECK_SECS, "0")
+                .status()
+                .unwrap();
+            assert!(status.success(), "local nebula {args:?}");
+        };
+        local(&["add", local_proj.to_str().unwrap()]);
+        local(&["workspace", "add", "client"]);
+        local(&["workspace", "host", "client", "fakebox"]);
+    });
+    tui.wait_for_text("local-app");
+
+    // ---- w, down to the bound tab, Enter: the other machine's tree ----
+    tui.send(b"w");
+    tui.wait_for_text("client ⇄ fakebox");
+    tui.send(b"j");
+    tui.send(ENTER);
+    tui.wait_for_text("⇄ fakebox");
+    tui.wait_for_text("remote-etl");
+    tui.wait_for_gone("local-app");
+
+    // ---- and back: the local tree, with the daemon's scope restored ----
+    tui.send(b"w");
+    tui.send(b"k");
+    tui.send(ENTER);
+    tui.wait_for_text("local-app");
+    tui.wait_for_gone("remote-etl");
+    tui.wait_for_gone("⇄ fakebox");
 }

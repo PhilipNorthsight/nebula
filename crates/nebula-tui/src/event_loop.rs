@@ -8,7 +8,7 @@ use crate::app::{
     PointerShape, PromptDialog, PromptKind, RowKey, SessionRow, SettingsView, SplitterDrag,
     SubmenuKind, TermSelection, WorktreeRollback,
 };
-use crate::app::{PrCommentAnswer, PrDiffAnswer};
+use crate::app::{LinkTarget, PrCommentAnswer, PrDiffAnswer};
 use crate::pull_request::Lookup;
 use crate::text_input::TextInput;
 use crate::tree_browser::TreeBrowser;
@@ -255,6 +255,7 @@ async fn main_loop(
     let mut app = App::new();
     app.conn = ConnState::Connected;
     app.startup_workspace = startup_workspace;
+    app.workspace_hosts = crate::workspace_hosts::load();
     let cfg = crate::config::Config::load();
     apply_config(&mut app, &cfg);
     app.keymap = cfg.keymap();
@@ -330,6 +331,10 @@ async fn main_loop(
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
     app.vim_tx = Some(vim_tx);
+    // A REMOTE WORKSPACE link (or the way back): the connect runs off the
+    // loop — an ssh handshake is seconds, an install minutes — and the
+    // channels it produces land here to be swapped in.
+    let (link_tx, mut link_rx) = tokio::sync::mpsc::unbounded_channel::<LinkAnswer>();
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -361,7 +366,10 @@ async fn main_loop(
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
             // Fixed deadline (not a fresh sleep per iteration) so heavy PTY
             // traffic can't starve the badge refresh.
-            _ = tokio::time::sleep_until(next_git_poll) => {
+            // Every lookup on this tick runs git or gh against a checkout's
+            // path — paths on another machine while a REMOTE WORKSPACE is
+            // showing, so none of it runs then.
+            _ = tokio::time::sleep_until(next_git_poll), if app.remote.is_none() => {
                 request_git_changes(&mut app, &git_tx);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
@@ -387,7 +395,7 @@ async fn main_loop(
             // `Shift+R` asked for the pull requests now: the same lookups
             // the git tick runs, on this turn instead of up to `GIT_POLL`
             // later.
-            _ = std::future::ready(()), if app.pr_refresh_requested => {
+            _ = std::future::ready(()), if app.pr_refresh_requested && app.remote.is_none() => {
                 app.pr_refresh_requested = false;
                 lookup_pull_request(&mut app, &pr_tx);
                 sweep_pull_request(&mut app, &pr_tx);
@@ -490,10 +498,20 @@ async fn main_loop(
                 }
                 None => {
                     app.conn = ConnState::Disconnected;
-                    app.flash = Some("daemon connection lost".into());
+                    app.flash = Some(match &app.remote {
+                        Some(lens) => format!(
+                            "lost the connection to {} — `w` to a local workspace, or back here to reconnect",
+                            lens.host
+                        ),
+                        None => "daemon connection lost".into(),
+                    });
                     app.dirty = true;
                 }
             },
+            // The new connection answered: swap it in, or say why not.
+            Some(answer) = link_rx.recv() => {
+                adopt_link(&mut app, channels, answer).await;
+            }
             ev = vim_rx.recv() => {
                 // Never None: app.vim_tx keeps a sender alive.
                 if let Some(ev) = ev {
@@ -653,6 +671,10 @@ async fn main_loop(
             }
         }
 
+        if let Some(target) = app.pending_link.take() {
+            start_link(&mut app, target, link_tx.clone());
+        }
+
         if app.should_quit {
             // Whatever the pull-request lookups learned since the last tick,
             // written inline: the process is about to end, and a write
@@ -660,15 +682,283 @@ async fn main_loop(
             if let Some((cache, store, live)) = crate::pr_cache::take_flush(&mut app) {
                 crate::pr_cache::write_all(&cache, &store, &live);
             }
-            // Persist selection so the next launch restores it.
-            let _ = channels
-                .tx
-                .send(ClientRequest::SaveUiState {
-                    json: ui_state_json(&app),
-                })
-                .await;
+            // Persist selection so the next launch restores it. Not to a
+            // remote daemon: the ids would be its, the widths this
+            // screen's, and the local daemon is the one the next launch
+            // asks.
+            if app.remote.is_none() {
+                let _ = channels
+                    .tx
+                    .send(ClientRequest::SaveUiState {
+                        json: ui_state_json(&app),
+                    })
+                    .await;
+            }
             return Ok(app.pending_ssh.take());
         }
+    }
+}
+
+/// What a link attempt came back with: the channels to swap in, or the
+/// reason there are none, plus which attempt this was.
+struct LinkAnswer {
+    generation: u64,
+    target: LinkTarget,
+    result: Result<ipc::IpcChannels, String>,
+}
+
+/// Start connecting where `target` says, off the loop. The connection on
+/// screen stays until the new one answers, so a remote that never does
+/// costs a flash, not the local tree.
+fn start_link(
+    app: &mut App,
+    target: LinkTarget,
+    link_tx: tokio::sync::mpsc::UnboundedSender<LinkAnswer>,
+) {
+    app.link_generation += 1;
+    let generation = app.link_generation;
+    app.conn = ConnState::Connecting;
+    app.flash = Some(match &target {
+        LinkTarget::Remote { host, .. } => format!("connecting to {host}…"),
+        LinkTarget::Local { .. } => "reconnecting to this machine…".into(),
+    });
+    app.dirty = true;
+    tokio::spawn(async move {
+        let result = match &target {
+            LinkTarget::Local { .. } => ipc::connect_or_spawn().await.map(ipc::split_connection),
+            LinkTarget::Remote { host, env, .. } => ipc::connect_remote(host, env).await,
+        };
+        let _ = link_tx.send(LinkAnswer {
+            generation,
+            target,
+            result: result.map_err(|e| format!("{e:#}")),
+        });
+    });
+}
+
+/// The connection answered. A stale answer — the user switched again
+/// before it came — is dropped, which kills its ssh. A live one replaces
+/// the channels: the old connection closes (a remote's ssh dies with it,
+/// the local socket just closes; no daemon anywhere stops), the pane
+/// lets go of a session that lives on the other side, and a fresh
+/// Subscribe asks the new daemon for its tree.
+async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: LinkAnswer) {
+    if answer.generation != app.link_generation {
+        return;
+    }
+    let target = answer.target;
+    let new = match answer.result {
+        Ok(new) => new,
+        Err(err) => {
+            // The old connection is still the one on screen.
+            app.conn = if channels.tx.is_closed() {
+                ConnState::Disconnected
+            } else {
+                ConnState::Connected
+            };
+            app.flash = Some(err);
+            app.dirty = true;
+            return;
+        }
+    };
+    *channels = new;
+    app.conn = ConnState::Connected;
+    // The pane's session is on the machine we just left; its parser and
+    // cache go with it.
+    app.term = None;
+    app.term_locked = false;
+    app.term_cache.clear();
+    app.git_changes_inflight = None;
+    match &target {
+        LinkTarget::Remote {
+            host, workspace, ..
+        } => {
+            app.remote = Some(crate::app::RemoteLens {
+                host: host.clone(),
+                workspace: workspace.clone(),
+                remote_workspace: None,
+            });
+            // The remote's Snapshot fills these; until it lands the tab is
+            // empty rather than showing the local rows that used to file
+            // under it.
+            app.tree.projects.clear();
+            app.tree.worktrees.clear();
+            app.tree.agents.clear();
+            app.tree.terminals.clear();
+            app.tree.links.clear();
+            app.flash = Some(format!("{host}: connected"));
+        }
+        LinkTarget::Local { workspace } => {
+            app.remote = None;
+            app.link_workspace = Some(workspace.clone());
+            app.flash = None;
+        }
+    }
+    clamp_selections(app);
+    if channels.tx.send(ClientRequest::Subscribe).await.is_err() {
+        app.conn = ConnState::Disconnected;
+    }
+    // Scope the local connection the way the switch would have, so
+    // AddProject files under the picked tab and the daemon remembers it.
+    if let LinkTarget::Local { workspace } = &target {
+        let req_id = app.alloc_req_id(PendingIntent::None);
+        let _ = channels
+            .tx
+            .send(ClientRequest::OpenWorkspace {
+                req_id,
+                id: workspace.clone(),
+            })
+            .await;
+    }
+    app.dirty = true;
+}
+
+/// Ask the loop to point the connection at `workspace`'s machine — its
+/// bound host, or this one — when that is not where it already points.
+/// True when a link was queued (the caller then leaves the daemon's
+/// OpenWorkspace to `adopt_link`).
+fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
+    let binding = app.workspace_hosts.get(workspace.as_str()).cloned();
+    match (binding, app.remote.clone()) {
+        // A bound tab, and its machine is not the one connected.
+        (Some(binding), lens) if lens.as_ref().map(|l| l.host.as_str()) != Some(binding.host()) => {
+            app.pending_link = Some(LinkTarget::Remote {
+                host: binding.host().to_string(),
+                env: binding.env().clone(),
+                workspace: workspace.clone(),
+            });
+            true
+        }
+        // Another tab bound to the machine already connected: the same
+        // tree, refiled under the new tab.
+        (Some(_), Some(mut lens)) => {
+            lens.workspace = workspace.clone();
+            for p in &mut app.tree.projects {
+                p.workspace_id = workspace.clone();
+            }
+            app.remote = Some(lens);
+            false
+        }
+        // Covered by the first arm's guard (no remote connected means the
+        // host can't match), but the compiler can't see through a guard
+        // and a wildcard would hide a real miss.
+        (Some(_), None) => false,
+        // A local tab while a remote is showing: come home.
+        (None, Some(_)) => {
+            app.pending_link = Some(LinkTarget::Local {
+                workspace: workspace.clone(),
+            });
+            true
+        }
+        (None, None) => false,
+    }
+}
+
+/// The entity lists of a remote daemon's Snapshot, as received.
+struct RemoteTree {
+    workspaces: Vec<nebula_core::Workspace>,
+    active_workspace: WorkspaceId,
+    projects: Vec<nebula_core::Project>,
+    worktrees: Vec<nebula_core::Worktree>,
+    agents: Vec<nebula_core::Agent>,
+    terminals: Vec<nebula_core::TerminalTab>,
+    links: Vec<nebula_core::Link>,
+}
+
+/// Where a remote's Snapshot goes: the tree under the lens. The local
+/// Workspaces bar is kept — the remote's workspaces are its own business —
+/// and one of them is shown: the remote workspace named like the bound
+/// tab when there is one (a `Motum` tab here shows the `Motum` workspace
+/// there, however that machine was left), else the remote's open one. Its
+/// projects come through refiled under the local tab. The remote's
+/// `ui_state` and read markers are about its rows and this screen doesn't
+/// restore them; the pull-request cache is left alone, since pruning it to
+/// another machine's tree would empty it. When the pick is not the
+/// remote's open workspace, this connection is scoped to it (the same
+/// OpenWorkspace a switch there would send), so `n` adds a project into
+/// the workspace on screen.
+fn ingest_remote_snapshot(app: &mut App, tree: RemoteTree, out: &mut Vec<ClientRequest>) {
+    let RemoteTree {
+        workspaces,
+        active_workspace,
+        projects,
+        worktrees,
+        agents,
+        terminals,
+        links,
+    } = tree;
+    let Some(lens) = &app.remote else {
+        return;
+    };
+    let tab_name = app
+        .tree
+        .workspaces
+        .iter()
+        .find(|w| w.id == lens.workspace)
+        .map(|w| w.name.clone());
+    let remote_workspace = workspaces
+        .iter()
+        .find(|w| Some(&w.name) == tab_name.as_ref())
+        .map(|w| w.id.clone())
+        .unwrap_or(active_workspace.clone());
+    if remote_workspace != active_workspace {
+        let id = remote_workspace.clone();
+        send(app, out, |req_id| ClientRequest::OpenWorkspace {
+            req_id,
+            id,
+        });
+    }
+    let Some(lens) = &mut app.remote else {
+        return;
+    };
+    lens.remote_workspace = Some(remote_workspace.clone());
+    let local = lens.workspace.clone();
+    app.tree.projects = projects
+        .into_iter()
+        .filter(|p| p.workspace_id == remote_workspace)
+        .map(|mut p| {
+            p.workspace_id = local.clone();
+            p
+        })
+        .collect();
+    app.tree.worktrees = worktrees;
+    app.tree.agents = agents;
+    app.tree.terminals = terminals;
+    app.tree.links = links;
+    app.sel_project = 0;
+    app.sel_worktree = 0;
+    app.sel_session = 0;
+}
+
+/// Flash and refuse a workspace create / rename / delete while a REMOTE
+/// WORKSPACE is showing: the connected daemon is the other machine's, and
+/// the tabs are this one's.
+fn workspace_edits_blocked(app: &mut App) -> bool {
+    match &app.remote {
+        Some(lens) => {
+            app.flash = Some(format!(
+                "workspaces are edited from a local tab — this one shows {}",
+                lens.host
+            ));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Flash and refuse when the feature under `what` needs this machine's
+/// files and a REMOTE WORKSPACE is showing — the checkouts on screen are
+/// on the other machine, where nothing here can open them.
+fn remote_blocks(app: &mut App, what: &str) -> bool {
+    match &app.remote {
+        Some(lens) => {
+            app.flash = Some(format!(
+                "{what} works on local checkouts — these are on {}",
+                lens.host
+            ));
+            true
+        }
+        None => false,
     }
 }
 
@@ -1276,6 +1566,9 @@ fn land_pr_detail(
 /// wants. A draft a refused post handed back while another modal was up
 /// (`pr_comment_drafts`) fills the box, so the refusal cost nothing typed.
 fn open_pr_comment(app: &mut App) {
+    if remote_blocks(app, "commenting on a pull request") {
+        return;
+    }
     let Some(pr) = app.previewed_pr() else {
         app.flash = Some("move onto a pull request row to comment on it".into());
         app.dirty = true;
@@ -1614,6 +1907,9 @@ fn schedule_pull_request_refresh(app: &mut App) {
 /// burst. The flash is the only immediate feedback: the rows repaint once
 /// the answers land, and a machine with no `gh` never repaints at all.
 fn refresh_pull_requests(app: &mut App) {
+    if remote_blocks(app, "pull-request lookup") {
+        return;
+    }
     let Some(project) = app.selected_project().map(|p| p.id.clone()) else {
         return;
     };
@@ -2258,8 +2554,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Hosts => open_hosts_picker(app),
         Action::AgentPresets => crate::preset_overlays::open_agent_presets(app),
         Action::QuickPrompt => crate::quick_prompt::open_quick_prompt(app),
-        Action::Issues => crate::issues::open_issues(app),
-        Action::SwitchBranch => crate::branch_switch::open_branch_switch(app),
+        Action::Issues => {
+            if !remote_blocks(app, "the issues modal") {
+                crate::issues::open_issues(app);
+            }
+        }
+        Action::SwitchBranch => {
+            if !remote_blocks(app, "the branch switcher") {
+                crate::branch_switch::open_branch_switch(app);
+            }
+        }
         // Ctrl+→ still reaches the terminal pane (the counterpart of the
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
@@ -2595,19 +2899,39 @@ fn quick_return_of(prompt: &PromptDialog) -> Option<crate::quick_prompt::QuickRe
 
 pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
     use std::borrow::Cow;
+    // Workspace rows live in this machine's daemon; while a remote's tree
+    // is on screen the request would create or rename a workspace over
+    // there instead.
+    if matches!(
+        kind,
+        PromptKind::NewWorkspace | PromptKind::RenameWorkspace { .. }
+    ) && workspace_edits_blocked(app)
+    {
+        return;
+    }
     let (title, label, input): (Cow<'static, str>, Cow<'static, str>, String) = match &kind {
         // Starts at "~/" with the home listing already showing, so the
         // browser is one ↓ away; typing a leading '/' or '~' replaces the
         // prefill (see the Char arm), and Ctrl+u clears it.
-        PromptKind::AddProject => (
-            "Add project".into(),
-            "path to a git repository".into(),
-            if nebula_core::env::home_dir().is_some() {
-                "~/".to_string()
-            } else {
-                String::new()
-            },
-        ),
+        // Under a REMOTE LENS the path is on that machine: the daemon that
+        // adds it is the remote's, so the prompt says whose disk it means
+        // and the "~/" prefill (this machine's home listing) is left off.
+        PromptKind::AddProject => match &app.remote {
+            Some(lens) => (
+                "Add project".into(),
+                format!("path to a git repository on {}", lens.host).into(),
+                String::new(),
+            ),
+            None => (
+                "Add project".into(),
+                "path to a git repository".into(),
+                if nebula_core::env::home_dir().is_some() {
+                    "~/".to_string()
+                } else {
+                    String::new()
+                },
+            ),
+        },
         PromptKind::NewWorktree { suggestion, .. } => (
             "New worktree".into(),
             format!("branch name (empty = {suggestion})").into(),
@@ -2712,6 +3036,25 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
                 .unwrap_or_default();
             ("Rename workspace".into(), "name".into(), current)
         }
+        PromptKind::WorkspaceHost { id } => {
+            let name = app
+                .tree
+                .workspaces
+                .iter()
+                .find(|w| &w.id == id)
+                .map(|w| w.name.clone())
+                .unwrap_or_default();
+            let current = app
+                .workspace_hosts
+                .get(id.as_str())
+                .map(|b| b.host().to_string())
+                .unwrap_or_default();
+            (
+                format!("Show another machine's projects under '{name}'").into(),
+                "ssh destination, like user@server (empty = this machine)".into(),
+                current,
+            )
+        }
         PromptKind::SettingText { kind } => {
             // Pre-filled with the stored value, not its display label: an
             // empty row reads `auto` on the overlay but edits as "".
@@ -2769,6 +3112,9 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
 /// cursor's worktree decides, falling back to the project's own clone when
 /// it has no worktrees yet or the one selected is gone from disk.
 fn open_repo_in_browser(app: &mut App) {
+    if remote_blocks(app, "opening the repo page") {
+        return;
+    }
     let root = app
         .selected_worktree()
         .map(|w| w.path.clone())
@@ -2800,6 +3146,9 @@ fn open_ghostty_tab(app: &mut App) {
 }
 
 fn open_ghostty_tab_with(app: &mut App, ghostty: Option<std::path::PathBuf>) {
+    if remote_blocks(app, "a Ghostty tab") {
+        return;
+    }
     let Some(ghostty) = ghostty.filter(|_| !app.is_remote) else {
         return;
     };
@@ -2900,6 +3249,9 @@ fn toggle_run_in(app: &mut App, worktree: &nebula_core::Worktree, out: &mut Vec<
 /// `Shift+Enter` on the Worktrees panel: fire the selected checkout's OPEN
 /// COMMAND.
 fn open_selected_worktree(app: &mut App) {
+    if remote_blocks(app, "opening a checkout") {
+        return;
+    }
     if app.selected_worktree_pr().is_some() {
         app.flash = Some("a pull request has no checkout to open — pick a worktree".into());
         return;
@@ -2974,6 +3326,9 @@ fn spawn_open_command(command: &str, cwd: &std::path::Path) -> std::io::Result<(
 /// read it. Flashes and returns None when no worktree is selected or its
 /// path is gone from disk.
 fn selected_checkout(app: &mut App) -> Option<(std::path::PathBuf, String)> {
+    if remote_blocks(app, "browsing files") {
+        return None;
+    }
     // Clone before touching app.overlay — selected_worktree borrows app.
     let Some((path, branch)) = app
         .selected_worktree()
@@ -3976,9 +4331,16 @@ fn open_workspace_picker(app: &mut App) {
                 .iter()
                 .filter(|p| p.workspace_id == w.id)
                 .count();
+            // A bound tab names its machine; its count is that machine's
+            // projects only while it is the one connected.
+            let host = app
+                .workspace_hosts
+                .get(w.id.as_str())
+                .map(|b| format!(" ⇄ {}", b.host()))
+                .unwrap_or_default();
             MenuItem::new(
                 format!(
-                    "{}{}  ({projects})",
+                    "{}{host}{}  ({projects})",
                     w.name,
                     if &w.id == active { " ✓" } else { "" }
                 ),
@@ -4059,10 +4421,15 @@ fn switch_workspace_inner(
     refresh_palette(app);
     // An open switcher keeps its ✓ on the now-open workspace.
     refresh_workspace_picker(app);
-    send(app, out, |req_id| ClientRequest::OpenWorkspace {
-        req_id,
-        id,
-    });
+    // A tab on another machine (or back from one) changes the daemon the
+    // requests go to; the loop makes that connection and scopes it. Only a
+    // tab on the daemon already connected is scoped here and now.
+    if !request_link_for(app, &id) {
+        send(app, out, |req_id| ClientRequest::OpenWorkspace {
+            req_id,
+            id,
+        });
+    }
     app.dirty = true;
     true
 }
@@ -4106,6 +4473,9 @@ fn reseat_deleted_workspace(
 /// last one), so a refusal after `y` just flashes. `reopen_picker` is the
 /// switcher's hover row when the confirm came from there.
 fn open_remove_workspace_confirm(app: &mut App, id: WorkspaceId, reopen_picker: Option<usize>) {
+    if workspace_edits_blocked(app) {
+        return;
+    }
     let Some(name) = app
         .tree
         .workspaces
@@ -4150,15 +4520,66 @@ fn reopen_workspace_picker(app: &mut App, hover: usize) {
     }
 }
 
-/// The Workspaces column's menu (`m`, right-click): the switcher's n / r / d
-/// verbs as rows, for the open workspace.
+/// The Workspaces column's menu (`m`, right-click): the switcher's n / r /
+/// h / d verbs as rows, for the open workspace.
 fn workspace_menu(app: &App) -> Vec<MenuItem> {
     let id = app.tree.active_workspace.clone();
+    let host = if app.workspace_hosts.contains_key(id.as_str()) {
+        "Change ssh host…"
+    } else {
+        "Show a remote machine's projects…"
+    };
     vec![
         MenuItem::new("New workspace", MenuAction::NewWorkspace),
         MenuItem::new("Rename workspace", MenuAction::RenameWorkspace(id.clone())),
+        MenuItem::new(host, MenuAction::WorkspaceHost(id.clone())),
         MenuItem::destructive("Delete workspace", MenuAction::RemoveWorkspace(id)),
     ]
+}
+
+/// `h` in the switcher, Enter'd: bind (or unbind) the workspace and, when
+/// it is the open tab, connect where it now points. The binding is written
+/// before anything connects, so a host that fails to answer is still
+/// bound — `h` again to fix the address, or empty to make the tab local.
+fn bind_workspace_host(app: &mut App, id: WorkspaceId, value: &str) {
+    let host = match crate::workspace_hosts::parse_host(value) {
+        Ok(host) => host,
+        Err(err) => {
+            app.flash = Some(err);
+            return;
+        }
+    };
+    // A new address keeps the variables the binding carried (they are
+    // set from the CLI's `--env`, which the one-line prompt has no room
+    // for); a first binding has none.
+    let binding = host.as_ref().map(|host| {
+        app.workspace_hosts
+            .get(id.as_str())
+            .map(|b| b.with_host(host.clone()))
+            .unwrap_or_else(|| crate::workspace_hosts::Binding::Host(host.clone()))
+    });
+    if let Err(err) = crate::workspace_hosts::set(&id, binding.as_ref()) {
+        app.flash = Some(format!("could not save the binding: {err}"));
+        return;
+    }
+    app.workspace_hosts = crate::workspace_hosts::load();
+    let name = app
+        .tree
+        .workspaces
+        .iter()
+        .find(|w| w.id == id)
+        .map(|w| w.name.clone())
+        .unwrap_or_default();
+    app.flash = Some(match &host {
+        Some(host) => format!("'{name}' now shows {host}'s projects"),
+        None => format!("'{name}' is local again"),
+    });
+    // Unbound while showing this machine already, or bound to the machine
+    // already connected: nothing to reconnect, and the daemon's scope is
+    // unchanged either way.
+    if app.tree.active_workspace == id {
+        request_link_for(app, &id);
+    }
 }
 
 fn refresh_workspace_picker(app: &mut App) {
@@ -4408,6 +4829,15 @@ pub(crate) fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<Cli
                 if let Some(mut sub) = build_submenu(&menu.items[menu.hover]) {
                     sub.parent = Some(Box::new(menu.clone()));
                     *menu = sub;
+                }
+            }
+            // In the workspace switcher h is a verb — bind the hovered
+            // workspace to a machine (REMOTE WORKSPACES), or unbind it —
+            // ahead of the vim-left below, which has no parent to go back
+            // to there anyway.
+            KeyCode::Char('h') if menu.is_workspace_picker() => {
+                if let Some(id) = menu.hovered_workspace() {
+                    open_prompt(app, PromptKind::WorkspaceHost { id });
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => {
@@ -5780,6 +6210,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
+        PromptKind::WorkspaceHost { id } => bind_workspace_host(app, id, &value),
         PromptKind::SettingText { kind } => {
             // Same path as a toggled row (`apply_setting_at`): write the
             // file, adopt it live, and land back on the overlay — with the
@@ -6123,7 +6554,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
-        MenuAction::SwitchBranch(id) => crate::branch_switch::open_for(app, &id),
+        MenuAction::SwitchBranch(id) => {
+            if !remote_blocks(app, "the branch switcher") {
+                crate::branch_switch::open_for(app, &id);
+            }
+        }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::RenameProject(id) => open_prompt(app, PromptKind::RenameProject { id }),
         MenuAction::OpenWorkspace(id) => {
@@ -6131,6 +6566,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::NewWorkspace => open_prompt(app, PromptKind::NewWorkspace),
         MenuAction::RenameWorkspace(id) => open_prompt(app, PromptKind::RenameWorkspace { id }),
+        MenuAction::WorkspaceHost(id) => open_prompt(app, PromptKind::WorkspaceHost { id }),
         MenuAction::RemoveWorkspace(id) => open_remove_workspace_confirm(app, id, None),
         MenuAction::RemoveProject(id) => {
             if let Some(p) = app.tree.projects.iter().find(|p| p.id == id).cloned() {
@@ -8596,6 +9032,27 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             pr_seen,
             ui_state,
         } => {
+            if app.remote.is_some() {
+                ingest_remote_snapshot(
+                    app,
+                    RemoteTree {
+                        workspaces,
+                        active_workspace,
+                        projects,
+                        worktrees,
+                        agents,
+                        terminals,
+                        links,
+                    },
+                    out,
+                );
+                clamp_selections(app);
+                refresh_palette(app);
+                refresh_workspace_picker(app);
+                schedule_prewarm(app);
+                app.dirty = true;
+                return;
+            }
             app.tree.workspaces = workspaces;
             app.tree.active_workspace = active_workspace;
             app.tree.projects = projects;
@@ -8612,6 +9069,21 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Before the UI-state restore, whose remembered project only
             // resolves against the workspace actually on screen.
             apply_startup_workspace(app, out);
+            // Back from a remote: the tab the user picked to come home to
+            // beats the daemon's remembered default.
+            if let Some(ws) = app.link_workspace.take() {
+                if app.tree.workspaces.iter().any(|w| w.id == ws) {
+                    app.tree.active_workspace = ws;
+                }
+            }
+            // Booting onto a tab bound to another machine: go there. Any
+            // later local Snapshot arrives with `link_workspace` set to a
+            // local tab, so this fires only at start and on a daemon
+            // restart.
+            let active = app.tree.active_workspace.clone();
+            if app.workspace_hosts.contains_key(active.as_str()) {
+                request_link_for(app, &active);
+            }
             let session_restored = ui_state
                 .as_deref()
                 .is_some_and(|json| restore_ui_state(app, json));
@@ -8955,7 +9427,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         }
         // `nebula open` in a session: the user asked to see these files.
         ServerEvent::FilesOpened { root, paths, .. } => {
-            crate::file_tabs::open(app, root, paths);
+            if !remote_blocks(app, "nebula open") {
+                crate::file_tabs::open(app, root, paths);
+            }
         }
         ServerEvent::Metrics { req_id, snapshot } => {
             // Answered with Metrics, not Ack — clear the pending slot by hand.
@@ -9094,8 +9568,20 @@ pub(crate) fn reopen_prompt_with(app: &mut App, kind: PromptKind, text: String) 
 fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
     use nebula_core::Entity;
     match entity {
+        // A remote's workspaces are its own; the bar stays this machine's.
+        Entity::Workspace(_) if app.remote.is_some() => {}
         Entity::Workspace(w) => upsert_by(&mut app.tree.workspaces, w, |x, y| x.id == y.id),
-        Entity::Project(p) => {
+        Entity::Project(mut p) => {
+            // Under a REMOTE LENS a project shows only from the remote's
+            // open workspace, refiled under the local tab (as the Snapshot
+            // did); one filed elsewhere over there leaves the list.
+            if let Some(lens) = &app.remote {
+                if lens.remote_workspace.as_ref() != Some(&p.workspace_id) {
+                    app.tree.projects.retain(|x| x.id != p.id);
+                    return;
+                }
+                p.workspace_id = lens.workspace.clone();
+            }
             let selected = app.selected_project().map(|p| p.id.clone());
             upsert_by(&mut app.tree.projects, p, |x, y| x.id == y.id);
             // Reorders arrive as plain upserts with new sort_orders; stable
@@ -9171,6 +9657,7 @@ fn upsert_by<T>(list: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
 fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
     use nebula_core::EntityId;
     match id {
+        EntityId::Workspace(_) if app.remote.is_some() => {}
         EntityId::Workspace(id) => {
             // Only empty workspaces get deleted, so no project rows need
             // cleanup here — but this instance may have been scoped to it,
@@ -26122,7 +26609,12 @@ diff --git a/src/c.rs b/src/c.rs
                 let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
                 assert_eq!(
                     labels,
-                    ["New workspace", "Rename workspace", "Delete workspace"]
+                    [
+                        "New workspace",
+                        "Rename workspace",
+                        "Show a remote machine's projects…",
+                        "Delete workspace"
+                    ]
                 );
                 assert!(!m.is_workspace_picker(), "verbs, not the switcher");
             }
@@ -26836,7 +27328,7 @@ diff --git a/src/c.rs b/src/c.rs
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("n: new  r: rename  d: delete"),
+            text.contains("n: new  r: rename  h: host  d: delete"),
             "hints at the bottom of the modal: {text}"
         );
 
@@ -30813,5 +31305,402 @@ diff --git a/src/c.rs b/src/c.rs
             "",
             "gone: the row is breathing space again"
         );
+    }
+}
+
+/// REMOTE WORKSPACES: the lens a remote daemon's tree is seen through, and
+/// the routing that decides when a workspace switch changes machines.
+#[cfg(test)]
+mod remote_lens_tests {
+    use super::tests::hse;
+    use super::*;
+    use crate::app::RemoteLens;
+    use nebula_core::{Entity, Project, ProjectId, ServerEvent, Workspace, WorkspaceId};
+
+    fn ws(id: &str) -> WorkspaceId {
+        WorkspaceId(id.into())
+    }
+
+    fn project(id: &str, workspace: &str) -> Project {
+        Project {
+            id: ProjectId(id.into()),
+            name: id.into(),
+            workspace_id: ws(workspace),
+            repo_path: format!("/srv/{id}").into(),
+            sort_order: 0,
+        }
+    }
+
+    fn snapshot(workspaces: Vec<Workspace>, active: &str, projects: Vec<Project>) -> ServerEvent {
+        ServerEvent::Snapshot {
+            workspaces,
+            active_workspace: ws(active),
+            projects,
+            worktrees: Vec::new(),
+            agents: Vec::new(),
+            terminals: Vec::new(),
+            links: Vec::new(),
+            pr_seen: Vec::new(),
+            ui_state: None,
+        }
+    }
+
+    /// A local app on two tabs, `default` and `motum`, the latter bound.
+    fn local_app() -> App {
+        let mut app = App::new();
+        app.workspace_hosts.insert(
+            "motum".into(),
+            crate::workspace_hosts::Binding::Host("fm@motum".into()),
+        );
+        hse(
+            &mut app,
+            snapshot(
+                vec![
+                    Workspace {
+                        id: ws("default"),
+                        name: "default".into(),
+                    },
+                    Workspace {
+                        id: ws("motum"),
+                        name: "Motum".into(),
+                    },
+                ],
+                "default",
+                vec![project("local", "default"), project("stale", "motum")],
+            ),
+        );
+        app
+    }
+
+    /// A remote workspace named like the tab wins over the remote's open
+    /// one, and the connection is scoped to it so adds land there.
+    #[test]
+    fn a_remote_workspace_named_like_the_tab_is_the_one_shown() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            workspace: ws("motum"),
+            remote_workspace: None,
+        });
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            snapshot(
+                vec![
+                    Workspace {
+                        id: ws("r-default"),
+                        name: "default".into(),
+                    },
+                    Workspace {
+                        id: ws("r-motum"),
+                        name: "Motum".into(),
+                    },
+                ],
+                "r-default",
+                vec![
+                    project("scratch", "r-default"),
+                    project("motum-etl", "r-motum"),
+                ],
+            ),
+            &mut out,
+        );
+        let shown: Vec<&str> = app.tree.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(shown, ["motum-etl"]);
+        assert_eq!(
+            app.remote.as_ref().unwrap().remote_workspace,
+            Some(ws("r-motum"))
+        );
+        assert!(out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == ws("r-motum"))));
+    }
+
+    /// The remote's Snapshot keeps this machine's tabs, takes only the
+    /// projects of the remote's open workspace (no workspace there shares
+    /// the tab's name), and files them under the bound tab so the panels
+    /// scope to it as usual.
+    #[test]
+    fn a_remote_snapshot_is_refiled_under_the_bound_tab() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            workspace: ws("motum"),
+            remote_workspace: None,
+        });
+        hse(
+            &mut app,
+            snapshot(
+                vec![Workspace {
+                    id: ws("r-default"),
+                    name: "default".into(),
+                }],
+                "r-default",
+                vec![
+                    project("client-etl", "r-default"),
+                    project("elsewhere", "r-other"),
+                ],
+            ),
+        );
+        let names: Vec<&str> = app
+            .tree
+            .workspaces
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, ["default", "Motum"], "the bar stays local");
+        assert_eq!(app.tree.active_workspace, ws("motum"));
+        let shown: Vec<(&str, &str)> = app
+            .tree
+            .projects
+            .iter()
+            .map(|p| (p.name.as_str(), p.workspace_id.as_str()))
+            .collect();
+        assert_eq!(shown, [("client-etl", "motum")]);
+        assert_eq!(
+            app.remote.as_ref().unwrap().remote_workspace,
+            Some(ws("r-default"))
+        );
+    }
+
+    /// Live deltas follow the same rule: a remote project in its open
+    /// workspace lands under the tab, one filed elsewhere over there leaves,
+    /// and the remote's workspace rows never touch the bar.
+    #[test]
+    fn remote_deltas_follow_the_lens() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        app.tree.projects.clear();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(project("client-etl", "r-default")),
+            },
+        );
+        assert_eq!(app.tree.projects[0].workspace_id, ws("motum"));
+        // Moved to another remote workspace: gone from this tab.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(project("client-etl", "r-other")),
+            },
+        );
+        assert!(app.tree.projects.is_empty());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Workspace(Workspace {
+                    id: ws("r-new"),
+                    name: "remote-only".into(),
+                }),
+            },
+        );
+        assert_eq!(
+            app.tree.workspaces.len(),
+            2,
+            "remote workspaces stay remote"
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: nebula_core::EntityId::Workspace(ws("default")),
+            },
+        );
+        assert_eq!(
+            app.tree.workspaces.len(),
+            2,
+            "nor do their removals reach it"
+        );
+    }
+
+    /// Switching onto a bound tab queues the link instead of scoping the
+    /// local daemon; switching back queues the way home; a plain local
+    /// switch still sends OpenWorkspace as before.
+    #[test]
+    fn switching_tabs_routes_the_connection() {
+        let mut app = local_app();
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Remote {
+                host: "fm@motum".into(),
+                env: Default::default(),
+                workspace: ws("motum"),
+            })
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })),
+            "no scope request for a daemon we are leaving: {out:?}"
+        );
+
+        // The link landed; now the user comes home.
+        app.pending_link = None;
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        out.clear();
+        assert!(switch_workspace(&mut app, ws("default"), &mut out));
+        assert_eq!(
+            app.pending_link,
+            Some(LinkTarget::Local {
+                workspace: ws("default"),
+            })
+        );
+        assert!(!out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::OpenWorkspace { .. })));
+
+        // Home again, on `default`: an unbound tab is the old path.
+        app.pending_link = None;
+        app.remote = None;
+        app.workspace_hosts.clear();
+        out.clear();
+        app.tree.active_workspace = ws("default");
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+        assert!(app.pending_link.is_none());
+        assert!(out
+            .iter()
+            .any(|r| matches!(r, ClientRequest::OpenWorkspace { id, .. } if *id == ws("motum"))));
+    }
+
+    /// Back from a remote, the local Snapshot lands on the tab the user
+    /// picked, not the daemon's remembered default — and booting onto a
+    /// bound tab links out at once.
+    #[test]
+    fn the_local_snapshot_lands_where_the_user_was_going() {
+        let mut app = local_app();
+        app.link_workspace = Some(ws("motum"));
+        // The daemon remembers `default`; the user asked for the bound tab.
+        let again = snapshot(
+            app.tree.workspaces.clone(),
+            "default",
+            vec![project("local", "default")],
+        );
+        hse(&mut app, again);
+        assert_eq!(app.tree.active_workspace, ws("motum"));
+        assert!(app.link_workspace.is_none());
+        assert!(matches!(app.pending_link, Some(LinkTarget::Remote { .. })));
+    }
+
+    /// A stale answer — from a link the user already moved on from — is
+    /// dropped; a failed one leaves the connection on screen alone.
+    #[tokio::test]
+    async fn link_answers_are_adopted_only_for_the_latest_attempt() {
+        let mut app = local_app();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let mut channels = ipc::IpcChannels {
+            tx,
+            rx: erx,
+            link: None,
+        };
+        app.link_generation = 2;
+        app.conn = ConnState::Connecting;
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 1,
+                target: LinkTarget::Local {
+                    workspace: ws("default"),
+                },
+                result: Err("late".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            app.conn,
+            ConnState::Connecting,
+            "a stale answer changes nothing"
+        );
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 2,
+                target: LinkTarget::Remote {
+                    host: "fm@motum".into(),
+                    env: Default::default(),
+                    workspace: ws("motum"),
+                },
+                result: Err("fm@motum: Permission denied".into()),
+            },
+        )
+        .await;
+        assert_eq!(app.conn, ConnState::Connected);
+        assert_eq!(app.flash.as_deref(), Some("fm@motum: Permission denied"));
+        assert!(app.remote.is_none());
+        assert_eq!(app.tree.projects.len(), 2, "the local tree is untouched");
+    }
+
+    /// While a remote is showing, the features that read this machine's
+    /// disk say so instead of failing on paths that exist elsewhere.
+    #[test]
+    fn local_only_features_are_refused_under_the_lens() {
+        let mut app = local_app();
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        assert!(selected_checkout(&mut app).is_none());
+        assert!(app.flash.as_deref().unwrap().contains("fm@motum"));
+        app.flash = None;
+        open_prompt(&mut app, PromptKind::NewWorkspace);
+        assert!(app.overlay.is_none());
+        assert!(app.flash.as_deref().unwrap().contains("local tab"));
+        // The bindings prompt itself is fine from anywhere.
+        open_prompt(&mut app, PromptKind::WorkspaceHost { id: ws("motum") });
+        assert!(matches!(&app.overlay, Some(Overlay::Prompt(p)) if p.input.as_str() == "fm@motum"));
+    }
+
+    /// The switcher's `h`: the binding is written, the cache refreshed, and
+    /// a change to the open tab reconnects where it now points.
+    #[test]
+    fn binding_the_open_tab_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::workspace_hosts::with_store_path(dir.path().join("workspace_hosts.json"), || {
+            let mut app = local_app();
+            app.workspace_hosts.clear();
+            bind_workspace_host(&mut app, ws("default"), "fm@box");
+            assert_eq!(app.workspace_hosts.get("default").unwrap().host(), "fm@box");
+            assert_eq!(
+                app.pending_link,
+                Some(LinkTarget::Remote {
+                    host: "fm@box".into(),
+                    env: Default::default(),
+                    workspace: ws("default"),
+                })
+            );
+            // One word only: a path after the host would become a command.
+            app.pending_link = None;
+            bind_workspace_host(&mut app, ws("default"), "fm@box /srv");
+            assert!(app.pending_link.is_none());
+            assert!(app.flash.as_deref().unwrap().contains("one word"));
+            // Empty unbinds; showing a remote, that means coming home.
+            app.remote = Some(RemoteLens {
+                host: "fm@box".into(),
+                workspace: ws("default"),
+                remote_workspace: None,
+            });
+            bind_workspace_host(&mut app, ws("default"), "");
+            assert!(!app.workspace_hosts.contains_key("default"));
+            assert_eq!(
+                app.pending_link,
+                Some(LinkTarget::Local {
+                    workspace: ws("default"),
+                })
+            );
+        });
     }
 }

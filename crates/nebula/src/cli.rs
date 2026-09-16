@@ -311,6 +311,15 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Serve this machine's daemon over stdin/stdout for a remote nebula.
+    ///
+    /// The far end of a REMOTE WORKSPACE: a nebula on another machine runs
+    /// `ssh <this host> nebula relay` and talks to the daemon here through it,
+    /// starting the daemon when none is running. Not for typing at — the
+    /// bytes are the daemon protocol. Hidden, but the name is a contract:
+    /// every nebula that binds a workspace to this host runs it.
+    #[command(hide = true)]
+    Relay,
     /// Phase-2 debug client: raw passthrough to a scratch session (Ctrl+\ detaches).
     #[command(hide = true, name = "_raw-attach")]
     RawAttach {
@@ -372,7 +381,17 @@ Examples:
   nebula workspace add client-work   create one
   nebula workspace list              list them; * marks the next default
   nebula workspace open client-work  the next instance opens into it
-  nebula --workspace client-work     aim one instance without switching";
+  nebula --workspace client-work     aim one instance without switching
+  nebula workspace host client-work fm@10.0.1.7
+                                     show that machine's projects under it";
+
+const WORKSPACE_HOST_EXAMPLES: &str = "\
+Examples:
+  nebula workspace host client-a fm@10.0.1.7     bind it
+  nebula workspace host client-a fm@10.0.1.7 \\
+      --env NEBULA_DATA_DIR=/home/fm/.neb/nebula \\
+      --env CLAUDE_CONFIG_DIR=/home/fm/.neb       its nebula lives in its own dirs
+  nebula workspace host client-a --clear         make it local again";
 
 const BROWSER_EXAMPLES: &str = "\
 Examples:
@@ -494,5 +513,34 @@ pub(crate) enum WorkspaceCommand {
         name: String,
         /// Its new name.
         new_name: String,
+    },
+    /// Show another machine's projects under a workspace, over ssh.
+    ///
+    /// Binds the workspace to an ssh destination: opening it in the TUI
+    /// connects to that machine's nebula (installing it there if missing)
+    /// and shows its projects, worktrees and sessions in place of local
+    /// ones, with the agents running there. The binding is this machine's
+    /// (`workspace_hosts.json` beside `ssh_hosts.json`); the remote is an
+    /// ordinary nebula that needs no setup for it. Same in the TUI: `h` on a
+    /// row of the `w` switcher.
+    #[command(after_help = WORKSPACE_HOST_EXAMPLES)]
+    Host {
+        /// Workspace to bind.
+        name: String,
+        /// ssh destination — `user@server`, or a Host from ~/.ssh/config.
+        #[arg(required_unless_present_any = ["clear", "env"], conflicts_with = "clear")]
+        host: Option<String>,
+        /// Export NAME=value on the remote before its nebula runs (repeatable).
+        ///
+        /// For a machine whose nebula is launched with its own environment:
+        /// an isolated NEBULA_DATA_DIR / NEBULA_RUNTIME_DIR, or the
+        /// CLAUDE_CONFIG_DIR its agents should start with. A bare ssh
+        /// command sees none of the login shell's variables, so the binding
+        /// carries them. Given without a host, the existing host is kept.
+        #[arg(long = "env", value_name = "NAME=value", conflicts_with = "clear")]
+        env: Vec<String>,
+        /// Unbind: the workspace shows local projects again.
+        #[arg(long)]
+        clear: bool,
     },
 }

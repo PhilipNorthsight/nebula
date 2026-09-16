@@ -10,15 +10,10 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const INSTALL_URL: &str =
-    "https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh";
-
 /// The published install script, with `NEBULA_INSTALL_URL` as the override
-/// hook (tests point it at a file:// URL). Shared with `nebula ssh`.
-pub(crate) fn install_url() -> String {
-    nebula_core::env::non_empty(nebula_core::env::INSTALL_URL)
-        .unwrap_or_else(|| INSTALL_URL.to_string())
-}
+/// hook (tests point it at a file:// URL). Shared with `nebula ssh` and the
+/// TUI's REMOTE WORKSPACES link, which is why it lives in nebula-core.
+pub(crate) use nebula_core::remote_script::install_url;
 
 /// Printed whenever a daemon from an older binary is left running: the only
 /// way onto the new code is a restart, and a restart takes the sessions.

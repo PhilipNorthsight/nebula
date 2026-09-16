@@ -9,6 +9,7 @@ pub mod mem;
 pub mod paths;
 pub mod project_file;
 pub mod protocol;
+pub mod remote_script;
 pub mod settings;
 
 pub use entities::*;

@@ -77,6 +77,21 @@ nebula workspace open <name>    # open it in the next instance you launch
 nebula workspace list           # list workspaces; * marks the one new instances open into
 nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
+nebula workspace host <name> <user@host>  # show that machine's projects under the workspace:
+                                # opening it connects to the nebula there over ssh (installing
+                                # it if missing) and lists its projects, worktrees and sessions
+                                # in place of local ones. Recorded in this machine's
+                                # workspace_hosts.json; the remote needs no setup. Same as `h`
+                                # on a row of the TUI's `w` switcher
+nebula workspace host <name> <user@host> --env NAME=value …  # for a machine whose nebula runs
+                                # with its own environment (an isolated NEBULA_DATA_DIR /
+                                # NEBULA_RUNTIME_DIR, the CLAUDE_CONFIG_DIR its agents start
+                                # with): exported there before its nebula runs, since a bare
+                                # ssh command sees none of the login shell's variables.
+                                # Repeatable; without a host, keeps the current one
+nebula workspace host <name> --clear      # make it local again
+nebula relay                    # (internal) what a remote workspace runs on the far end:
+                                # this machine's daemon socket over stdin/stdout
 ```
 
 ## Settings

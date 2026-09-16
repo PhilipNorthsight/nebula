@@ -27,7 +27,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::browser;
-use crate::ssh::{export_settings_bundle, install_prelude, shell_single_quote};
+use crate::ssh::{export_settings_bundle, install_prelude, install_url, shell_single_quote};
 
 /// Both ends of the tunnel are loopback: the local listener ssh binds, and
 /// the address on the remote that ssh connects the other end to.
@@ -185,7 +185,7 @@ fn spawn_ssh(opts: &TunnelOpts, local: u16, remote: u16) -> Result<Child> {
         .then(nebula_tui::bundle::for_remote)
         .flatten();
     let cmd = remote_command(
-        &crate::upgrade::install_url(),
+        &install_url(),
         remote,
         opts.path.as_deref(),
         bundle.as_deref(),

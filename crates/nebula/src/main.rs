@@ -34,9 +34,15 @@ fn main() -> Result<()> {
                 WorkspaceCommand::Rename { name, new_name } => {
                     WorkspaceOp::Rename { name, new_name }
                 }
+                // `--clear` and a destination are mutually exclusive in clap,
+                // so an absent host here is the clear.
+                WorkspaceCommand::Host {
+                    name, host, env, ..
+                } => WorkspaceOp::Host { name, host, env },
             };
             nebula_tui::run_workspace(op)
         }
+        Some(Command::Relay) => nebula_tui::run_relay(),
         Some(Command::Config { command }) => nebula_tui::run_config(match command {
             ConfigCommand::Path => nebula_tui::ConfigOp::Path,
             ConfigCommand::Export { path } => nebula_tui::ConfigOp::Export { path },

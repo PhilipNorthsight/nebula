@@ -387,7 +387,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // `?` jump to the hovered harness's Agents section.
             let agent_jump = menu.hovered_agent_kind().is_some();
             let hint = if menu.is_workspace_picker() {
-                Some(" n: new  r: rename  d: delete ")
+                Some(" n: new  r: rename  h: host  d: delete ")
             } else if menu.filter.is_some() {
                 Some(if agent_jump {
                     " type to filter  ?: settings  ↑↓: move  Backspace  Esc: back "
@@ -3096,7 +3096,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Per-tab display data, pre-collected to end the tree borrow: name,
     // rollup, and how many sessions under it finished unread — the same
     // count the project and worktree rows carry, one tier up.
-    let rows: Vec<(String, Option<AgentStatus>, usize)> = app
+    let rows: Vec<(String, Option<AgentStatus>, usize, bool)> = app
         .tree
         .workspaces
         .iter()
@@ -3105,6 +3105,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                 w.name.clone(),
                 app.workspace_rollup(&w.id),
                 app.workspace_unseen(&w.id),
+                app.workspace_hosts.contains_key(w.id.as_str()),
             )
         })
         .collect();
@@ -3115,7 +3116,7 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let tabs: Vec<(Vec<Span<'static>>, u16, Color)> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, roll, done))| {
+        .map(|(i, (name, roll, done, bound))| {
             let selected = Some(i) == active;
             // Only nine tabs have a shortcut; past that the slot stays
             // blank so every name still starts on the same column.
@@ -3139,6 +3140,11 @@ fn draw_workspaces_bar(f: &mut Frame, app: &mut App, area: Rect) {
                     format!(" {done} done"),
                     Style::default().fg(th.done),
                 ));
+            }
+            // A tab bound to another machine (REMOTE WORKSPACES) wears the
+            // link mark the footer uses for the machine on screen.
+            if *bound {
+                spans.push(Span::styled(" ⇄", Style::default().fg(th.dim)));
             }
             spans.push(Span::raw(" "));
             if selected {
@@ -4868,6 +4874,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     let conn = match app.conn {
         ConnState::Connected => Span::styled("⏻ connected", Style::default().fg(th.ok)),
         ConnState::Disconnected => Span::styled("✗ disconnected", Style::default().fg(th.err)),
+        ConnState::Connecting => Span::styled("… connecting", Style::default().fg(th.warn)),
     };
     let hints = if let Some(flash) = &app.flash {
         Span::styled(flash.clone(), Style::default().fg(th.warn))
@@ -4969,7 +4976,7 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         )
     } else if matches!(&app.overlay, Some(Overlay::Menu(m)) if m.is_workspace_picker()) {
         Span::styled(
-            "Enter: open  n: new  r: rename  d: delete  Esc: close",
+            "Enter: open  n: new  r: rename  h: host  d: delete  Esc: close",
             Style::default().fg(th.dim),
         )
     } else if app.overlay.is_some() {
@@ -5180,7 +5187,17 @@ fn draw_footer_bar(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
         ));
         spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
     }
-    if matches!(app.conn, ConnState::Disconnected) {
+    // A REMOTE WORKSPACE names the machine whose tree is on screen, in
+    // the same warning color an ssh'd-into nebula wears: the checkouts
+    // and sessions shown are over there.
+    if let Some(lens) = &app.remote {
+        spans.push(Span::styled(
+            format!("⇄ {}", truncate(&lens.host, 24)),
+            Style::default().fg(th.warn).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
+    }
+    if matches!(app.conn, ConnState::Disconnected | ConnState::Connecting) {
         spans.push(conn);
         spans.push(Span::styled("  ·  ", Style::default().fg(th.dim)));
     }
