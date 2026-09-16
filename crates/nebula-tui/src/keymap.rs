@@ -603,7 +603,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         action: Action::Splash,
         id: "splash",
-        label: "Nebula splash",
+        label: "Northsight splash",
         hint: "Replay the startup splash (any key returns)",
         group: "GENERAL",
         scope: Scope::Global,

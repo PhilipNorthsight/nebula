@@ -1,15 +1,17 @@
-//! First-run splash: a procedurally animated nebula filling the body while
-//! the project tree is empty. Every cell is computed per frame — a rotating
-//! spiral-arm density field modulated by value noise picks a glyph from a
-//! dust ramp, with a hashed starfield twinkling in the empty sky and the
-//! wordmark materializing in a carved-out band the dust never paints.
-//! Indexed colors only: Terminal.app has no truecolor.
+//! First-run splash: the Northsight summit filling the body while the
+//! project tree is empty. Every cell is computed per frame — the mark's
+//! nested chevrons drawn as line art that rises out of the ground on
+//! fade-in, valley mist of value noise drifting at its feet, a glint
+//! sweeping the outlines, a hashed starfield twinkling in the empty sky,
+//! and the wordmark materializing in a carved-out band the scene never
+//! paints. Indexed colors only: Terminal.app has no truecolor.
 //!
 //! The event loop ticks a repaint every [`FRAME`] while [`App::splash_active`]
 //! holds; the scene itself is a pure function of elapsed time, so a missed
 //! frame skips ahead instead of stuttering.
 
 use crate::app::{App, Focus, HitTarget};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,22 +26,45 @@ pub const FRAME: Duration = Duration::from_millis(100);
 /// briefly on every launch before the daemon's first tree snapshot lands.
 const FADE_IN: f32 = 1.2;
 
-/// Glyph ramp, thin dust -> bright core. Single-width chars only.
-const RAMP: &[char] = &['.', ':', '·', '+', '*', '*', 'o', '@'];
-/// 256-color ramp under `RAMP`: deep blue -> violet -> magenta -> pink.
-const DUST: &[u8] = &[17, 54, 55, 92, 93, 129, 135, 177];
-/// Wordmark gradient, swept left to right.
-const MARK: &[u8] = &[99, 105, 141, 177, 213, 219];
+/// The compact mark for panes too narrow for the block wordmark, and for
+/// the empty-body hint: the summit glyph.
+pub const MARK: &str = "▲ ";
+/// The name under the mark.
+pub const NAME: &str = "northsight";
 
-/// 5-row block bitmaps for N E B U L A.
+/// Northsight greens on the xterm-256 cube: forest -> moss -> sage -> pale.
+const GREENS: &[u8] = &[22, 28, 64, 71, 107, 150, 193];
+/// The glint that sweeps the wordmark and the outlines.
+const GLINT: u8 = 194;
+/// Valley mist, thin and thick.
+const MIST_THIN: u8 = 22;
+const MIST_THICK: u8 = 65;
+
+/// Columns per row of descent along a flank: steeper than 45° on a 2:1
+/// terminal cell, like the mark.
+const SLOPE: f32 = 1.6;
+
+fn tone(g: f32) -> u8 {
+    GREENS[(g.clamp(0.0, 1.0) * (GREENS.len() as f32 - 1.0)).round() as usize]
+}
+
+/// 5-row block bitmaps for N O R T H S I G H T.
 const LETTERS: &[&[&str; 5]] = &[
     &["#...#", "##..#", "#.#.#", "#..##", "#...#"],
-    &["####", "#...", "###.", "#...", "####"],
-    &["###.", "#..#", "###.", "#..#", "###."],
-    &["#..#", "#..#", "#..#", "#..#", ".##."],
-    &["#...", "#...", "#...", "#...", "####"],
-    &[".##.", "#..#", "####", "#..#", "#..#"],
+    &[".##.", "#..#", "#..#", "#..#", ".##."],
+    &["###.", "#..#", "###.", "#.#.", "#..#"],
+    &["#####", "..#..", "..#..", "..#..", "..#.."],
+    &["#..#", "#..#", "####", "#..#", "#..#"],
+    &[".###", "#...", ".##.", "...#", "###."],
+    &["###", ".#.", ".#.", ".#.", "###"],
+    &[".###", "#...", "#.##", "#..#", ".###"],
+    &["#..#", "#..#", "####", "#..#", "#..#"],
+    &["#####", "..#..", "..#..", "..#..", "..#.."],
 ];
+
+fn wordmark_width() -> usize {
+    LETTERS.iter().map(|l| l[0].len()).sum::<usize>() + 2 * (LETTERS.len() - 1)
+}
 
 fn hash(x: i32, y: i32, salt: u32) -> u32 {
     let mut h = (x as u32).wrapping_mul(374_761_393)
@@ -66,27 +91,17 @@ fn vnoise(x: f32, y: f32, salt: u32) -> f32 {
     a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
 }
 
-/// Dust density at physical offset (dx, dy) from the galaxy core: two
-/// spiral arms whose phase advances with radius (rotating with `rot`),
-/// broken up by noise sampled in a counter-rotating frame so the wisps
-/// shear against the arms instead of riding them.
-fn density(dx: f32, dy: f32, rot: f32) -> f32 {
-    let r = (dx * dx + dy * dy).sqrt().max(0.001);
-    let theta = dy.atan2(dx);
-    let arm = ((2.0 * theta - r * 2.6 + rot).cos() * 0.5 + 0.5).powi(3);
-    let (sa, ca) = (rot * 0.3).sin_cos();
-    let (nx, ny) = (dx * ca - dy * sa, dx * sa + dy * ca);
-    let wisp = 0.55 + 0.45 * vnoise(nx * 3.0 + 7.0, ny * 3.0 + 3.0, 991);
-    let falloff = (-r * 1.6).exp();
-    let core = (-r * r * 22.0).exp();
-    (arm * wisp * falloff * 1.5 + core).min(1.0)
+/// Wordmark tone across the word: deep at the edges, sage in the middle,
+/// mirroring the mark's light-centred gradient.
+fn word_tone(u: f32) -> f32 {
+    0.2 + 0.8 * (1.0 - (2.0 * u - 1.0).abs())
 }
 
 /// One wordmark row as per-cell spans: gradient across the word, a slow
-/// shine sweeping through, and the blocks materializing from static
+/// glint sweeping through, and the blocks materializing from static
 /// (`░` -> `▒` -> `█`) while the scene fades in.
 fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
-    let width: usize = LETTERS.iter().map(|l| l[0].len()).sum::<usize>() + 2 * (LETTERS.len() - 1);
+    let width = wordmark_width();
     let block = if fade < 0.5 {
         "░"
     } else if fade < 0.85 {
@@ -106,10 +121,9 @@ fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
                 let u = col as f32 / width as f32;
                 let shine = (u * 5.0 - t * 1.4).sin() > 0.93;
                 let color = if shine && fade >= 1.0 {
-                    231 // near-white glint
+                    GLINT
                 } else {
-                    let gi = (u * (MARK.len() as f32 - 1.0)).round() as usize;
-                    MARK[gi]
+                    tone(word_tone(u))
                 };
                 spans.push(Span::styled(
                     block,
@@ -124,6 +138,169 @@ fn wordmark_line(row: usize, t: f32, fade: f32) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+/// The rule the mark draws between the summit and the name, in the same
+/// light-centred gradient; dashed until the wordmark has materialized.
+fn rule_line(fade: f32) -> Line<'static> {
+    let width = wordmark_width();
+    let glyph = if fade < 0.85 { "╌" } else { "─" };
+    let spans = (0..width)
+        .map(|c| {
+            let u = c as f32 / width as f32;
+            Span::styled(
+                glyph,
+                Style::default().fg(Color::Indexed(tone(word_tone(u)))),
+            )
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+/// One chevron of the mark: apex cell, tone at the feet, tone at the apex.
+struct Chevron {
+    ax: f32,
+    ay: f32,
+    lo: f32,
+    hi: f32,
+}
+
+impl Chevron {
+    /// Row the outline passes through at column `x`.
+    fn row_at(&self, x: f32) -> f32 {
+        self.ay + (x - self.ax).abs() / SLOPE
+    }
+}
+
+/// Empty sky: sparse stars on their own twinkle phases, plus the rare
+/// accent-colored sparkle.
+fn star(buf: &mut Buffer, x: u16, y: u16, t: f32, fade: f32, accent: Color) {
+    let h = hash(i32::from(x), i32::from(y), 12_345);
+    if !h.is_multiple_of(53) {
+        return;
+    }
+    let phase = ((h >> 8) % 8) as f32 * 0.8;
+    let tw = ((t * 2.5 + phase).sin() * 0.5 + 0.5) * fade;
+    if tw <= 0.45 {
+        return;
+    }
+    if (h >> 4).is_multiple_of(111) {
+        buf[(x, y)].set_char('+').set_fg(accent);
+    } else if tw > 0.8 {
+        buf[(x, y)].set_char('·').set_fg(Color::Indexed(189));
+    } else {
+        buf[(x, y)].set_char('.').set_fg(Color::Indexed(60));
+    }
+}
+
+fn in_rect(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom()
+}
+
+/// The mark as line art in the sky above `carve`: the summit's outer and
+/// inner chevrons and its small foot, the two shoulder peaks tucked behind
+/// it wherever they pass under the summit, exactly as the logo nests them.
+fn summit(buf: &mut Buffer, area: Rect, carve: Rect, t: f32, fade: f32, accent: Color) {
+    let base = f32::from(carve.y) - 1.0;
+    let top = f32::from(area.y) + 1.0;
+    let h = (base - top).max(3.0);
+    let cx = f32::from(area.x) + f32::from(area.width) / 2.0;
+    let outer = Chevron {
+        ax: cx,
+        ay: base - h,
+        lo: 0.4,
+        hi: 0.85,
+    };
+    let inner = Chevron {
+        ax: cx,
+        ay: base - h * 0.70,
+        lo: 0.65,
+        hi: 1.0,
+    };
+    let foot = Chevron {
+        ax: cx,
+        ay: base - h * 0.36,
+        lo: 0.45,
+        hi: 0.7,
+    };
+    let left = Chevron {
+        ax: cx - h * SLOPE * 0.62,
+        ay: base - h * 0.62,
+        lo: 0.0,
+        hi: 0.35,
+    };
+    let right = Chevron {
+        ax: cx + h * SLOPE * 0.68,
+        ay: base - h * 0.68,
+        lo: 0.0,
+        hi: 0.35,
+    };
+    // Back to front: the summit paints over the shoulders where they meet.
+    let order: [(&Chevron, bool); 5] = [
+        (&left, true),
+        (&right, true),
+        (&outer, false),
+        (&inner, false),
+        (&foot, false),
+    ];
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if in_rect(carve, x, y) {
+                continue;
+            }
+            let (xf, yf) = (f32::from(x), f32::from(y));
+            // The mark rises out of the ground while the scene fades in.
+            let risen = yf <= base && (base - yf) <= fade * (h + 2.0);
+            let mut hit: Option<(char, u8)> = None;
+            if risen {
+                for (c, shoulder) in order {
+                    let r = c.row_at(xf);
+                    if r > base || (yf - r).abs() > 0.75 {
+                        continue;
+                    }
+                    if shoulder && yf >= outer.row_at(xf) - 0.75 {
+                        continue; // hidden behind the summit
+                    }
+                    let glyph = if (xf - c.ax).abs() < 0.5 {
+                        '▲'
+                    } else if xf < c.ax {
+                        '╱'
+                    } else {
+                        '╲'
+                    };
+                    let g = (base - yf) / (base - c.ay).max(1.0);
+                    let p = (xf - c.ax) / (h * SLOPE);
+                    let shine = (p * 3.0 - t * 1.1).sin() > 0.95;
+                    let color = if shine && fade >= 1.0 {
+                        GLINT
+                    } else {
+                        tone(c.lo + (c.hi - c.lo) * g)
+                    };
+                    hit = Some((glyph, color));
+                }
+            }
+            if let Some((ch, color)) = hit {
+                buf[(x, y)].set_char(ch).set_fg(Color::Indexed(color));
+                continue;
+            }
+            // Valley mist hugging the feet, drifting slowly to the right.
+            if yf <= base && yf > base - h * 0.55 {
+                let m = vnoise(xf * 0.09 - t * 0.12, yf * 0.35, 4242)
+                    * (-(base - yf) / (h * 0.28)).exp()
+                    * fade;
+                if m > 0.30 {
+                    let (ch, color) = if m > 0.5 {
+                        (':', MIST_THICK)
+                    } else {
+                        ('.', MIST_THIN)
+                    };
+                    buf[(x, y)].set_char(ch).set_fg(Color::Indexed(color));
+                    continue;
+                }
+            }
+            star(buf, x, y, t, fade, accent);
+        }
+    }
 }
 
 pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
@@ -142,18 +319,20 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     let raw = (t / FADE_IN).clamp(0.0, 1.0);
     let fade = raw * raw * (3.0 - 2.0 * raw);
 
-    // ---- text block: wordmark, tagline, key hints, bottom-anchored ----
-    let big = area.width >= 50 && area.height >= 18;
+    // ---- text block: wordmark, rule, tagline, key hints, bottom-anchored ----
+    let big = area.width >= wordmark_width() as u16 + 6 && area.height >= 20;
     let mut lines: Vec<Line> = Vec::new();
     if big {
         for row in 0..5 {
             lines.push(wordmark_line(row, t, fade));
         }
+        lines.push(Line::from(""));
+        lines.push(rule_line(fade));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("◆ ", Style::default().fg(th.accent)),
+            Span::styled(MARK, Style::default().fg(th.accent)),
             Span::styled(
-                "nebula",
+                NAME,
                 Style::default().fg(th.text).add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -194,16 +373,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
         width: block_w,
         height: block_h,
     };
-
-    // ---- galaxy centered in the sky above the text ----
-    let above = (text.y - area.y).max(4);
-    let cx = f32::from(area.x) + f32::from(area.width) / 2.0;
-    let cy = f32::from(area.y) + f32::from(above) / 2.0;
-    // Independent x/y scales stretch the disc to fill the sky; a terminal
-    // cell is ~2x taller than wide, hence the factor 2 on y.
-    let sx = 2.35 / (0.42 * f32::from(area.width)).max(4.0);
-    let sy = 2.0 * 2.35 / (1.6 * f32::from(above)).max(4.0);
-    // Text carve: rows the dust and stars never touch.
+    // Text carve: rows the scene never touches.
     let carve = Rect {
         x: text.x.saturating_sub(3),
         y: text.y.saturating_sub(1),
@@ -212,44 +382,7 @@ pub fn draw_splash(f: &mut Frame, app: &mut App, area: Rect) {
     }
     .intersection(area);
 
-    let rot = t * 0.25;
-    let buf = f.buffer_mut();
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if x >= carve.left() && x < carve.right() && y >= carve.top() && y < carve.bottom() {
-                continue;
-            }
-            let dx = (f32::from(x) - cx) * sx;
-            let dy = (f32::from(y) - cy) * sy;
-            let d = density(dx, dy, rot) * fade;
-            if d >= 0.055 {
-                let v = ((d - 0.055) / 0.945).clamp(0.0, 1.0);
-                let i = (v * (RAMP.len() as f32 - 1.0)).round() as usize;
-                buf[(x, y)]
-                    .set_char(RAMP[i])
-                    .set_fg(Color::Indexed(DUST[i]));
-                continue;
-            }
-            // Empty sky: sparse stars on their own twinkle phases, plus
-            // the rare accent-colored sparkle.
-            let h = hash(i32::from(x), i32::from(y), 12_345);
-            if !h.is_multiple_of(53) {
-                continue;
-            }
-            let phase = ((h >> 8) % 8) as f32 * 0.8;
-            let tw = ((t * 2.5 + phase).sin() * 0.5 + 0.5) * fade;
-            if tw <= 0.45 {
-                continue;
-            }
-            if (h >> 4).is_multiple_of(111) {
-                buf[(x, y)].set_char('+').set_fg(th.accent);
-            } else if tw > 0.8 {
-                buf[(x, y)].set_char('·').set_fg(Color::Indexed(189));
-            } else {
-                buf[(x, y)].set_char('.').set_fg(Color::Indexed(60));
-            }
-        }
-    }
+    summit(f.buffer_mut(), area, carve, t, fade, th.accent);
 
     f.render_widget(Paragraph::new(lines).centered(), text);
     // A click anywhere lands focus back on the (invisible) projects panel,

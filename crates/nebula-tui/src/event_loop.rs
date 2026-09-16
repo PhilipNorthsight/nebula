@@ -2198,7 +2198,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.overlay = Some(Overlay::Metrics(MetricsView::new()));
             request_metrics(app, out);
         }
-        // Replay the first-run nebula splash, fade-in included.
+        // Replay the first-run northsight splash, fade-in included.
         Action::Splash => {
             app.splash_epoch = std::time::Instant::now();
             app.splash_preview = true;

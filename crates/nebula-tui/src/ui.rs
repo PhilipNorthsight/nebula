@@ -193,7 +193,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // First run (the default workspace is empty): no visible projects
     // means three empty panels, so the whole body becomes the animated
-    // nebula splash until the first project lands. Other empty workspaces
+    // northsight splash until the first project lands. Other empty workspaces
     // keep their panels. N summons the same splash as a dismissable
     // preview.
     if app.splash_showing() {
@@ -827,7 +827,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Hosts]), "ssh hosts: connect (a: new, d: del)"),
                         (Act(&[Settings]), "settings (Hotkeys tab rebinds these)"),
                         (Act(&[Metrics]), "memory usage (nebula + agents)"),
-                        (Act(&[Splash]), "nebula splash (any key returns)"),
+                        (Act(&[Splash]), "northsight splash (any key returns)"),
                         (Act(&[Quit, Help]), "quit / toggle this help"),
                     ],
                 ),
@@ -4701,9 +4701,9 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.insert(0, Line::from(""));
             }
             lines.push(Line::from(vec![
-                Span::styled("◆ ", Style::default().fg(th.accent)),
+                Span::styled(crate::splash::MARK, Style::default().fg(th.accent)),
                 Span::styled(
-                    "nebula",
+                    crate::splash::NAME,
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 ),
             ]));
