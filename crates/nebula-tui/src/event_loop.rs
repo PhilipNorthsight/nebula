@@ -496,17 +496,7 @@ async fn main_loop(
                     log_server_event(&server_event);
                     handle_server_event(&mut app, server_event, &mut out);
                 }
-                None => {
-                    app.conn = ConnState::Disconnected;
-                    app.flash = Some(match &app.remote {
-                        Some(lens) => format!(
-                            "lost the connection to {} — `w` to a local workspace, or back here to reconnect",
-                            lens.host
-                        ),
-                        None => "daemon connection lost".into(),
-                    });
-                    app.dirty = true;
-                }
+                None => connection_lost(&mut app),
             },
             // The new connection answered: swap it in, or say why not.
             Some(answer) = link_rx.recv() => {
@@ -664,10 +654,13 @@ async fn main_loop(
             }
         }
 
+        let changing_link = app.conn == ConnState::Connecting || app.pending_link.is_some();
         for req in out.drain(..) {
+            if changing_link {
+                continue;
+            }
             if channels.tx.send(req).await.is_err() {
-                app.conn = ConnState::Disconnected;
-                app.dirty = true;
+                connection_lost(&mut app);
             }
         }
 
@@ -686,7 +679,10 @@ async fn main_loop(
             // remote daemon: the ids would be its, the widths this
             // screen's, and the local daemon is the one the next launch
             // asks.
-            if app.remote.is_none() {
+            if app.remote.is_none()
+                && app.conn != ConnState::Connecting
+                && app.pending_link.is_none()
+            {
                 let _ = channels
                     .tx
                     .send(ClientRequest::SaveUiState {
@@ -791,6 +787,9 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
     app.term = None;
     app.term_locked = false;
     app.term_cache.clear();
+    app.attached_sref = None;
+    app.pending_attach = None;
+    app.pending_prewarm = None;
     app.git_changes_inflight = None;
     match &target {
         LinkTarget::Remote {
@@ -2055,7 +2054,7 @@ fn send_with(
 }
 
 fn connecting_blocks(app: &mut App) -> bool {
-    if app.conn != ConnState::Connecting {
+    if app.conn != ConnState::Connecting && app.pending_link.is_none() {
         return false;
     }
     let destination = app
@@ -2066,6 +2065,28 @@ fn connecting_blocks(app: &mut App) -> bool {
     app.flash = Some(format!("connecting to {destination} — a moment"));
     app.dirty = true;
     true
+}
+
+fn connection_lost(app: &mut App) {
+    if app.conn == ConnState::Connecting || app.pending_link.is_some() {
+        return;
+    }
+    app.conn = ConnState::Disconnected;
+    app.flash = Some(match &app.remote {
+        Some(lens) => format!(
+            "lost the connection to {} — `w` to a local workspace, or back here to reconnect",
+            lens.host
+        ),
+        None => "daemon connection lost".into(),
+    });
+    app.dirty = true;
+}
+
+fn forward_input(app: &mut App, out: &mut Vec<ClientRequest>, session: SessionRef, data: Vec<u8>) {
+    if connecting_blocks(app) {
+        return;
+    }
+    out.push(ClientRequest::Input { session, data });
 }
 
 fn log_server_event(ev: &ServerEvent) {
@@ -2296,12 +2317,8 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
             // A stand-in pane (QUICK PROMPT, checkout still being cut) has
             // no PTY to paste into.
             if app.focus == Focus::Terminal && app.term_locked && !app.pane_shows_placeholder() {
-                if let Some(term) = &app.term {
-                    // Bracketed paste so the child (claude, vim…) knows.
-                    out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
-                        data: bracketed(&text),
-                    });
+                if let Some(session) = app.term.as_ref().map(|term| term.sref.clone()) {
+                    forward_input(app, out, session, bracketed(&text));
                 }
             }
         }
@@ -2474,6 +2491,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // session attaches, and must not land in the previous one.
         let stand_in = app.pane_shows_placeholder();
         if !exited {
+            let mut input = None;
             if let Some(term) = &mut app.term {
                 // Typing changes the content under a persisted selection
                 // highlight — drop it.
@@ -2486,11 +2504,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     return;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
-                    out.push(ClientRequest::Input {
-                        session: term.sref.clone(),
-                        data,
-                    });
+                    input = Some((term.sref.clone(), data));
                 }
+            }
+            if let Some((session, data)) = input {
+                forward_input(app, out, session, data);
             }
             return;
         }
@@ -4495,13 +4513,17 @@ fn switch_workspace_inner(
     remember_context(app);
     app.tree.active_workspace = id.clone();
     app.sel_project = 0;
+    let routed = request_link_for(app, &id);
+    let changing_endpoint = app.pending_link.is_some();
     if restore {
         // Land on the project this workspace was left on before restoring
         // the worktree and session, which are remembered per project and
         // per worktree — restoring them against row 0 would bring back the
         // wrong project's context.
         restore_workspace_project(app);
-        restore_context(app, out);
+        if !changing_endpoint {
+            restore_context(app, out);
+        }
     }
     clamp_selections(app);
     refresh_palette(app);
@@ -4510,7 +4532,7 @@ fn switch_workspace_inner(
     // A tab on another machine (or back from one) changes the daemon the
     // requests go to; the loop makes that connection and scopes it. Only a
     // tab on the daemon already connected is scoped here and now.
-    if !request_link_for(app, &id) {
+    if !routed {
         send(app, out, |req_id| ClientRequest::OpenWorkspace {
             req_id,
             id,
@@ -7979,19 +8001,21 @@ fn mouse_report(sgr: bool, button: u16, release: bool, col: u16, row: u16) -> Ve
 /// Hand the program in the pane one report of `button` at the pointer,
 /// clamped to the pane the way a drag-selection's head is.
 fn forward_mouse(
-    app: &App,
+    app: &mut App,
     out: &mut Vec<ClientRequest>,
     sgr: bool,
     button: u16,
     release: bool,
     mouse: &MouseEvent,
 ) {
-    if let Some(term) = &app.term {
+    if let Some(session) = app.term.as_ref().map(|term| term.sref.clone()) {
         let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
-        out.push(ClientRequest::Input {
-            session: term.sref.clone(),
-            data: mouse_report(sgr, button, release, col, row),
-        });
+        forward_input(
+            app,
+            out,
+            session,
+            mouse_report(sgr, button, release, col, row),
+        );
     }
 }
 
@@ -9022,6 +9046,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // grid is empty, so there is nothing to scroll either
                 // (`child_mouse_mode` calls it mouseless).
                 let (mouse_mode, sgr) = app.child_mouse_mode();
+                let mut input = None;
                 if let Some(term) = &mut app.term {
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
@@ -9035,19 +9060,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         // "Scroll wheel is sending arrow keys" warning.
                         let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
                         let button: u16 = if up { 64 } else { 65 };
-                        out.push(ClientRequest::Input {
-                            session: term.sref.clone(),
-                            data: mouse_report(sgr, button, false, col, row),
-                        });
+                        input = Some((
+                            term.sref.clone(),
+                            mouse_report(sgr, button, false, col, row),
+                        ));
                     } else if alternate {
                         // Full-screen apps that ignore the mouse (plain vim,
                         // less, htop with mouse off) expect arrows, one per
                         // line the notch would have scrolled.
                         let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
-                        out.push(ClientRequest::Input {
-                            session: term.sref.clone(),
-                            data: arrow.repeat(TERM_WHEEL_LINES),
-                        });
+                        input = Some((term.sref.clone(), arrow.repeat(TERM_WHEEL_LINES)));
                     } else {
                         let new_scroll = if up {
                             term.scroll.saturating_add(TERM_WHEEL_LINES)
@@ -9057,6 +9079,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         term.set_scroll(new_scroll);
                     }
                     app.dirty = true;
+                }
+                if let Some((session, data)) = input {
+                    forward_input(app, out, session, data);
                 }
             }
         }
@@ -9225,9 +9250,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             apply_startup_workspace(app, out);
             // Back from a remote: the tab the user picked to come home to
             // beats the daemon's remembered default.
+            let mut linked_workspace = false;
             if let Some(ws) = app.link_workspace.take() {
                 if app.tree.workspaces.iter().any(|w| w.id == ws) {
                     app.tree.active_workspace = ws;
+                    linked_workspace = true;
                 }
             }
             app.live_workspace = Some(app.tree.active_workspace.clone());
@@ -9242,6 +9269,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             let session_restored = ui_state
                 .as_deref()
                 .is_some_and(|json| restore_ui_state(app, json));
+            if linked_workspace {
+                app.sel_project = 0;
+                restore_workspace_project(app);
+                restore_context(app, out);
+            }
             clamp_selections(app);
             refresh_palette(app);
             // Boot the restored worktree's sessions right away — the first
@@ -9255,7 +9287,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // No debounce: a boot restores one remembered session once, so
             // there is no cursor sweep to wait out — only the user waiting
             // to see the screen they left.
-            if session_restored {
+            if session_restored && !linked_workspace {
                 preview_selected_now(app, out);
             }
             app.dirty = true;
@@ -31470,7 +31502,7 @@ diff --git a/src/c.rs b/src/c.rs
 /// the routing that decides when a workspace switch changes machines.
 #[cfg(test)]
 mod remote_lens_tests {
-    use super::tests::hse;
+    use super::tests::{hse, seed_tree};
     use super::*;
     use crate::app::RemoteLens;
     use nebula_core::{Entity, Project, ProjectId, ServerEvent, Workspace, WorkspaceId};
@@ -32040,6 +32072,67 @@ mod remote_lens_tests {
             app.flash.as_deref(),
             Some("connecting to fm@motum — a moment")
         );
+    }
+
+    #[test]
+    fn switching_endpoints_does_not_attach_remembered_sessions() {
+        let mut app = local_app();
+        seed_tree(&mut app);
+        let project = ProjectId("p1".into());
+        let worktree = WorktreeId("w1".into());
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        app.tree
+            .projects
+            .iter_mut()
+            .find(|candidate| candidate.id == project)
+            .unwrap()
+            .workspace_id = ws("motum");
+        app.last_project_for_workspace
+            .insert(ws("motum"), project.clone());
+        app.last_worktree_for_project
+            .insert(project, worktree.clone());
+        app.last_session_for_worktree.insert(worktree, session);
+        let mut out = Vec::new();
+
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+
+        assert!(app.pending_link.is_some());
+        assert!(out.iter().all(|request| !matches!(
+            request,
+            ClientRequest::Attach { .. } | ClientRequest::Detach { .. }
+        )));
+    }
+
+    #[test]
+    fn terminal_input_waits_for_the_link_to_land() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.conn = ConnState::Connecting;
+        let mut out = Vec::new();
+
+        forward_input(
+            &mut app,
+            &mut out,
+            SessionRef::Agent(AgentId("a1".into())),
+            b"hello".to_vec(),
+        );
+
+        assert!(out.is_empty());
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("connecting to fm@motum — a moment")
+        );
+    }
+
+    #[test]
+    fn losing_the_old_channel_does_not_end_the_transition() {
+        let mut app = local_app();
+        app.conn = ConnState::Connecting;
+
+        connection_lost(&mut app);
+
+        assert_eq!(app.conn, ConnState::Connecting);
+        assert!(app.flash.is_none());
     }
 
     #[test]
