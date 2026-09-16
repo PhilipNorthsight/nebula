@@ -768,6 +768,7 @@ async fn adopt_link(app: &mut App, channels: &mut ipc::IpcChannels, answer: Link
                 id: daemon_workspace,
             }];
             restore_context(app, &mut out);
+            sync_pty_size(app, &mut out);
             clamp_selections(app);
             refresh_palette(app);
             refresh_workspace_picker(app);
@@ -854,6 +855,7 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
         // A bound tab, and its machine is not the one connected.
         (Some(binding), lens)
             if app.conn == ConnState::Disconnected
+                || (app.conn == ConnState::Connecting && app.live_workspace.is_none())
                 || lens.as_ref().is_none_or(|lens| {
                     lens.host != binding.host() || &lens.env != binding.env()
                 }) =>
@@ -894,6 +896,13 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
             true
         }
         (None, None) => {
+            if app.conn == ConnState::Connecting && app.live_workspace.is_none() {
+                app.pending_link = Some(LinkTarget::Local {
+                    workspace: workspace.clone(),
+                    origin,
+                });
+                return true;
+            }
             if app.pending_link.take().is_some() || app.conn == ConnState::Connecting {
                 app.link_generation += 1;
                 app.conn = ConnState::Connected;
@@ -905,7 +914,9 @@ fn request_link_for(app: &mut App, workspace: &WorkspaceId) -> bool {
 }
 
 fn workspace_endpoint_is_live(app: &App, workspace: &WorkspaceId) -> bool {
-    if app.conn == ConnState::Disconnected {
+    if app.conn == ConnState::Disconnected
+        || (app.conn == ConnState::Connecting && app.live_workspace.is_none())
+    {
         return false;
     }
     match app.workspace_hosts.get(workspace.as_str()) {
@@ -2078,6 +2089,7 @@ fn connecting_blocks(app: &mut App) -> bool {
 }
 
 fn connection_lost(app: &mut App) {
+    app.live_workspace = None;
     if app.conn == ConnState::Connecting || app.pending_link.is_some() {
         return;
     }
@@ -2212,6 +2224,9 @@ fn restore_ui_state(app: &mut App, json: &str) -> bool {
 
 /// Keep the vt100 parser and the daemon PTY sized to the drawn pane.
 fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.conn == ConnState::Connecting || app.pending_link.is_some() {
+        return;
+    }
     let area = app.term_area;
     if !pane_usable(area) {
         return;
@@ -32011,6 +32026,33 @@ mod remote_lens_tests {
     }
 
     #[test]
+    fn returning_to_a_dead_remote_queues_a_fresh_link() {
+        let mut app = local_app();
+        app.tree.active_workspace = ws("motum");
+        app.remote = Some(RemoteLens {
+            host: "fm@motum".into(),
+            env: Default::default(),
+            workspace: ws("motum"),
+            remote_workspace: Some(ws("r-default")),
+        });
+        app.live_workspace = Some(ws("motum"));
+        let mut out = Vec::new();
+        assert!(switch_workspace(&mut app, ws("default"), &mut out));
+        app.pending_link = None;
+        app.conn = ConnState::Connecting;
+        connection_lost(&mut app);
+
+        out.clear();
+        assert!(switch_workspace(&mut app, ws("motum"), &mut out));
+
+        assert_ne!(app.conn, ConnState::Connected);
+        assert!(matches!(
+            app.pending_link,
+            Some(LinkTarget::Remote { ref host, .. }) if host == "fm@motum"
+        ));
+    }
+
+    #[test]
     fn reselecting_a_disconnected_bound_tab_reconnects() {
         let mut app = local_app();
         app.tree.active_workspace = ws("motum");
@@ -32143,6 +32185,72 @@ mod remote_lens_tests {
 
         assert_eq!(app.conn, ConnState::Connecting);
         assert!(app.flash.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_link_applies_a_deferred_terminal_resize() {
+        let mut app = local_app();
+        seed_tree(&mut app);
+        let project = ProjectId("p1".into());
+        let worktree = WorktreeId("w1".into());
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        app.last_project_for_workspace
+            .insert(ws("default"), project.clone());
+        app.last_worktree_for_project
+            .insert(project, worktree.clone());
+        app.last_session_for_worktree
+            .insert(worktree, session.clone());
+        app.term = Some(AttachedTerm::new(session.clone(), 80, 24));
+        app.attached_sref = Some(session.clone());
+        app.term_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.tree.active_workspace = ws("motum");
+        app.conn = ConnState::Connecting;
+        app.link_generation = 1;
+        let mut deferred = Vec::new();
+
+        sync_pty_size(&mut app, &mut deferred);
+
+        assert!(deferred.is_empty());
+        assert_eq!(
+            app.term.as_ref().map(|term| (term.cols, term.rows)),
+            Some((80, 24))
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_etx, erx) = tokio::sync::mpsc::channel(1);
+        let mut channels = ipc::IpcChannels {
+            tx,
+            rx: erx,
+            link: None,
+        };
+
+        adopt_link(
+            &mut app,
+            &mut channels,
+            LinkAnswer {
+                generation: 1,
+                target: LinkTarget::Remote {
+                    host: "fm@motum".into(),
+                    env: Default::default(),
+                    workspace: ws("motum"),
+                    origin: ws("default"),
+                },
+                result: Err("fm@motum: Permission denied".into()),
+            },
+        )
+        .await;
+
+        let mut requests = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            requests.push(request);
+        }
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            ClientRequest::Resize {
+                session: resized,
+                cols: 100,
+                rows: 30,
+            } if resized == &session
+        )));
     }
 
     #[test]
